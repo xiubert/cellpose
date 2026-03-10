@@ -583,6 +583,9 @@ class ViewBoxNoRightDrag(pg.ViewBox):
         self.parent = parent
         self.axHistoryPointer = -1
 
+    def wheelEvent(self, ev, axis=None):
+        ev.ignore()
+
     def keyPressEvent(self, ev):
         """
         This routine should capture key presses in the current view box.
@@ -635,7 +638,7 @@ class ImageDraw(pg.ImageItem):
                 self.parent.outlinesOn) and not self.parent.removing_region:
             is_right_click = ev.button() == QtCore.Qt.RightButton
             if self.parent.loaded \
-                    and (is_right_click or ev.modifiers() & QtCore.Qt.ShiftModifier and not ev.double())\
+                    and (is_right_click or (ev.modifiers() & QtCore.Qt.ShiftModifier and not ev.modifiers() & QtCore.Qt.ControlModifier and not ev.double()))\
                     and not self.parent.deleting_multiple:
                 if not self.parent.in_stroke:
                     ev.accept()
@@ -653,11 +656,12 @@ class ImageDraw(pg.ImageItem):
                     if ev.button() == QtCore.Qt.LeftButton and not ev.double():
                         idx = self.parent.cellpix[self.parent.currentZ][y, x]
                         if idx > 0:
-                            if ev.modifiers() & QtCore.Qt.ControlModifier:
+                            if ev.modifiers() & (QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier) == (QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier):
+                                ev.accept()
+                                self.parent.merge_cells(idx)
+                            elif ev.modifiers() & QtCore.Qt.ControlModifier:
                                 # delete mask selected
                                 self.parent.remove_cell(idx)
-                            elif ev.modifiers() & QtCore.Qt.AltModifier:
-                                self.parent.merge_cells(idx)
                             elif self.parent.masksOn and not self.parent.deleting_multiple:
                                 self.parent.unselect_cell()
                                 self.parent.select_cell(idx)

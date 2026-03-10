@@ -665,7 +665,7 @@ class MainW(QMainWindow):
         if self.loaded:
             if not (event.modifiers() &
                     (QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier |
-                     QtCore.Qt.AltModifier) or self.in_stroke):
+                     QtCore.Qt.MetaModifier) or self.in_stroke):
                 updated = False
                 if len(self.current_point_set) > 0:
                     if event.key() == QtCore.Qt.Key_Return:
@@ -1278,7 +1278,7 @@ class MainW(QMainWindow):
 
     def plot_clicked(self, event):
         if event.button()==QtCore.Qt.LeftButton \
-                and not event.modifiers() & (QtCore.Qt.ShiftModifier | QtCore.Qt.AltModifier)\
+                and not event.modifiers() & (QtCore.Qt.ShiftModifier | QtCore.Qt.MetaModifier)\
                 and not self.removing_region:
             if event.double():
                 try:
