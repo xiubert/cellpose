@@ -314,7 +314,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
               n_epochs=100, weight_decay=0.1, normalize=True, compute_flows=False,
               save_path=None, save_every=100, save_each=False, nimg_per_epoch=None,
               nimg_test_per_epoch=None, rescale=False, scale_range=None, bsize=256,
-              min_train_masks=5, model_name=None, class_weights=None):
+              min_train_masks=5, model_name=None, class_weights=None, use_bfloat16=False):
     """
     Train the network with images for segmentation.
 
@@ -356,8 +356,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
 
     device = net.device
 
-    original_net_dtype = net.dtype 
-    if net.dtype == torch.bfloat16:
+    original_net_dtype = net.dtype
+    if net.dtype == torch.bfloat16 and not use_bfloat16:
         # NOTE: this produces a side effect of returning a network that is not of a guaranteed dtype \
         train_logger.info(">>> converting bfloat16 network to float32 for training")
         net.dtype = torch.float32
@@ -462,10 +462,10 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
 
             with torch.autocast(device_type=device.type, dtype=net.dtype):
                 y = net(X)[0]
-            loss = _loss_fn_seg(lbl, y, device)
-            if y.shape[1] > 3:
-                loss3 = _loss_fn_class(lbl, y, class_weights=class_weights)
-                loss += loss3
+                loss = _loss_fn_seg(lbl, y, device)
+                if y.shape[1] > 3:
+                    loss3 = _loss_fn_class(lbl, y, class_weights=class_weights)
+                    loss += loss3
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -507,10 +507,10 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
 
                         with torch.autocast(device_type=device.type, dtype=net.dtype):
                             y = net(X)[0]
-                        loss = _loss_fn_seg(lbl, y, device)
-                        if y.shape[1] > 3:
-                            loss3 = _loss_fn_class(lbl, y, class_weights=class_weights)
-                            loss += loss3            
+                            loss = _loss_fn_seg(lbl, y, device)
+                            if y.shape[1] > 3:
+                                loss3 = _loss_fn_class(lbl, y, class_weights=class_weights)
+                                loss += loss3            
                         test_loss = loss.item()
                         test_loss *= len(imgi)
                         lavgt += test_loss
