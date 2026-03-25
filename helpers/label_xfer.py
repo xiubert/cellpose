@@ -37,9 +37,14 @@ def parse_args():
                         help="Directory containing TIF + XML files (env: DATA_DIR)")
     parser.add_argument("--out_dir", default=os.environ.get("OUT_DIR"),
                         help="Output directory; defaults to data_dir (env: OUT_DIR)")
+    parser.add_argument("--classes", nargs="+", default=None, metavar="CLASS",
+                        help="Restrict to these annotation classes, e.g. --classes IHC or --classes OHC. "
+                             "Default: use all classes.")
     args = parser.parse_args()
     if args.out_dir is None:
         args.out_dir = args.data_dir
+    if args.classes is not None:
+        args.classes = set(args.classes)
     return args
 
 
@@ -48,8 +53,10 @@ SAM_CHECKPOINT = args.checkpoint
 CHANNEL = args.channel
 DATA_DIR = args.data_dir
 OUT_DIR = args.out_dir
+CLASSES = args.classes  # set or None
 
-CHANNEL_SUFFIX = f"ch{CHANNEL}"
+_cls_suffix = "_" + "+".join(sorted(CLASSES)).lower() if CLASSES else ""
+CHANNEL_SUFFIX = f"ch{CHANNEL}{_cls_suffix}"
 
 sam = sam_model_registry["vit_h"](checkpoint=SAM_CHECKPOINT)
 sam.to("cuda")
@@ -62,6 +69,7 @@ def parse_voc_xml(xml_path):
     """Return (boxes, classes) from a VOC-style XML.
     boxes: list of [xmin, ymin, xmax, ymax] ints
     classes: list of str ('IHC' or 'OHC')
+    If CLASSES is set, only annotations whose name is in that set are returned.
     """
     root = ET.parse(xml_path).getroot()
     boxes, classes = [], []
@@ -71,6 +79,8 @@ def parse_voc_xml(xml_path):
         if name_el is None or bndbox is None:
             continue
         name = name_el.text or ""
+        if CLASSES is not None and name not in CLASSES:
+            continue
         xmin_el = bndbox.find("xmin")
         ymin_el = bndbox.find("ymin")
         xmax_el = bndbox.find("xmax")

@@ -12,10 +12,11 @@ Datasets such as Buswinka et al. (2024)[^1] ship with bounding box annotations b
 
 ```
 multi-channel TIF  →  extract target channel (0-based index)
+                   →  filter annotations by class (optional)
                    →  normalize uint16 → uint8 RGB
                    →  SAM box-prompted segmentation per annotation
                    →  combine into labelled instance mask
-                   →  save <stem>_ch<N>.tif + <stem>_ch<N>_seg.npy
+                   →  save <stem>_ch<N>[_<classes>].tif + <stem>_ch<N>[_<classes>]_seg.npy
 ```
 
 ## Example dataset
@@ -32,10 +33,18 @@ multi-channel TIF  →  extract target channel (0-based index)
 
 ## Outputs
 
-For each input `<stem>.tif`, two files are written to `OUT_DIR`:
+For each input `<stem>.tif`, two files are written to `OUT_DIR`.
+The suffix encodes the channel and, when `--classes` is used, the selected classes (sorted, lowercase):
 
-- **`<stem>_ch<N>.tif`** — single-channel uint16 image; this is the image Cellpose trains on.
-- **`<stem>_ch<N>_seg.npy`** — Cellpose seg dict with keys:
+| `--classes` | Output stem suffix |
+|---|---|
+| *(not set — all classes)* | `_ch<N>` |
+| `--classes IHC` | `_ch<N>_ihc` |
+| `--classes OHC` | `_ch<N>_ohc` |
+| `--classes IHC OHC` | `_ch<N>_ihc+ohc` |
+
+- **`<stem><suffix>.tif`** — single-channel uint16 image; this is the image Cellpose trains on.
+- **`<stem><suffix>_seg.npy`** — Cellpose seg dict with keys:
   - `masks` — int32 instance label array `(H, W)`, 0 = background
   - `outlines` — bool `(H, W)` outline array computed via `masks_to_outlines()`, required for the Cellpose GUI
   - `img` — the extracted channel array
@@ -57,9 +66,19 @@ python label_xfer.py \
     --out_dir /path/to/output      # optional; defaults to data_dir
 ```
 
+Restrict to a single cell class with `--classes`:
+
+```bash
+# IHC annotations only
+python label_xfer.py --channel 1 --data_dir /path/to/data --classes IHC
+
+# OHC annotations only
+python label_xfer.py --channel 1 --data_dir /path/to/data --classes OHC
+```
+
 Arguments can also be set via environment variables (`SAM_CHECKPOINT`, `CHANNEL`, `DATA_DIR`, `OUT_DIR`).
 
-The script skips any file whose `_seg.npy` already exists, so it is safe to re-run after interruption. Images where the target channel is blank are skipped with a warning.
+The script skips any file whose `_seg.npy` already exists, so it is safe to re-run after interruption (including separate runs per class). Images where the target channel is blank are skipped with a warning.
 
 ## Cellpose Training
 
@@ -73,7 +92,7 @@ python -m cellpose --train \
     --n_epochs 100
 ```
 
-Adjust `--img_filter` to match the channel suffix used (e.g. `_ch0`, `_ch2`).
+Adjust `--img_filter` to match the output suffix (e.g. `_ch1`, `_ch1_ihc`, `_ch1_ohc`).
 
 ## Notes
 
