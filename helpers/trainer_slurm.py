@@ -26,8 +26,8 @@ model_path, train_losses, test_losses = train.train_seg(model.net,
                             learning_rate=1e-6,      # was 1e-5 — drop an order of magnitude
                             n_epochs=200,            # was 100 — loss still trending at epoch 90
                             model_name="CLC_small_set",
-                            batch_size=8,            # was 1 — L40S has 46GB, use it
-                            use_bfloat16=True)
+                            batch_size=8            # was 1 — L40S has 46GB, use it
+                            )
 
 
 # quick test
