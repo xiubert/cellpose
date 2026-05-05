@@ -53,6 +53,10 @@ echo ""
 
 python "$HOME/cellpose/trainer_slurm.py"
 
+# Parse training log and write CSV + PNG alongside the .out file
+LOG_FILE="run_logs/cellpose_train_${SLURM_JOB_ID}.out"
+python "$HOME/cellpose/helpers/parse_training_log.py" "$LOG_FILE"
+
 crc-job-stats.py
 
 echo "Done."

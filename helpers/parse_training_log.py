@@ -6,6 +6,8 @@ import csv
 import sys
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")  # headless-safe; no display needed on SLURM
 import matplotlib.pyplot as plt
 
 # matches lines like: 0, train_loss=2.9191, test_loss=0.6794, LR=0.000000, time 12.27s
@@ -56,7 +58,6 @@ def plot(rows: list[dict], out_path: Path) -> None:
     plot_path = out_path.with_suffix(".png")
     fig.savefig(str(plot_path), dpi=150)
     print(f"Saved plot to {plot_path}")
-    plt.show()
 
 
 def main():
