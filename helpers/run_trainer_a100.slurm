@@ -3,12 +3,12 @@
 #SBATCH --cluster=gpu
 #SBATCH --partition=a100
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
 #SBATCH --time=06:00:00
 #SBATCH --qos=long
-#SBATCH --output=cellpose_train_%j.out
-#SBATCH --error=cellpose_train_%j.err
+#SBATCH --output=run_logs/cellpose_train_%j.out
+#SBATCH --error=run_logs/cellpose_train_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=[your_pitt_email]@pitt.edu
 
@@ -42,7 +42,7 @@ export CELLPOSE_TEST_DIR="$SLURM_SCRATCH/test"
 run_on_exit() {
     echo "Copying models back to project storage..."
     mkdir -p "$DATA_SRC/models"
-    cp -r "$SLURM_SCRATCH/train/models/." "$DATA_SRC/models/" 2>/dev/null || true
+    cp -r "$HOME/cellpose/models/." "$DATA_SRC/models/" 2>/dev/null || true
 }
 trap run_on_exit EXIT
 
