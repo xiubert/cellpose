@@ -131,6 +131,33 @@ crc-quota
 
 ---
 
+## Accessing Data and Scratch
+
+### Permanent data location
+Training data lives in `/ix1/<group>/cellpose/` and persists between jobs:
+```bash
+ls /ix1/$(id -gn)/cellpose/
+# train/   test/   models/
+```
+
+### Accessing scratch while a job is running
+During a job, data is copied to node-local scratch at `/scratch/slurm-<JOBID>/`. To inspect it, SSH directly to the compute node (visible in `squeue` output or the job log):
+```bash
+# Find the node your job is on
+squeue -M gpu -u $USER -o "%i %R %N"
+
+# SSH to it (no password needed from login node)
+ssh gpu-n35.crc.pitt.edu
+
+# Browse scratch
+ls /scratch/slurm-<JOBID>/train/
+ls /scratch/slurm-<JOBID>/test/
+```
+
+Scratch is automatically cleaned up when the job exits. The EXIT trap in the SLURM script copies trained models back to `/ix1/<group>/cellpose/models/` before that happens.
+
+---
+
 ## Notes
 
 | Topic | Detail |
