@@ -39,6 +39,16 @@ fi
 export CELLPOSE_TRAIN_DIR="$SLURM_SCRATCH/train"
 export CELLPOSE_TEST_DIR="$SLURM_SCRATCH/test"
 
+# --- Dump train/test input filenames to a job-tagged log ---
+INPUT_LOG="cellpose_train_${SLURM_JOB_ID}.inputs"
+{
+    echo "=== Train inputs ($CELLPOSE_TRAIN_DIR) ==="
+    ls "$CELLPOSE_TRAIN_DIR"
+    echo ""
+    echo "=== Test inputs ($CELLPOSE_TEST_DIR) ==="
+    ls "$CELLPOSE_TEST_DIR"
+} > "$INPUT_LOG"
+
 # --- Trap: copy model output back to project storage on exit (success or failure) ---
 run_on_exit() {
     echo "Copying models back to project storage..."
