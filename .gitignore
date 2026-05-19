@@ -138,3 +138,7 @@ backup/
 crops*
 ihc_ohc_run*
 ihc_ohc_sweep*
+*.npz
+*_preview.png
+*.pkl
+*_report.json

@@ -196,3 +196,147 @@ Classifier (`ihc_ohc_config.yaml`):
 `plot_boxes.py` and the Cellpose GUI still work, and the probability is
 available as a confidence score to fuse with the geometric classifier
 (weighted vote / tiebreaker).
+
+---
+
+# Geometric classifier + CNN fusion (Path A)
+
+A second, **training-free-capable** classifier from pure mask geometry,
+late-fused with the CNN. The CNN reads MYO7A *appearance*; this reads
+*where each cell sits in the organ of Corti*. Their errors are largely
+independent, so averaging them is the cheapest real accuracy gain
+available — and it needs **no change to the tuned CNN** (it already writes
+`class_prob` for exactly this).
+
+| File | Phase | Role |
+|---|---|---|
+| `ihc_ohc_geom.py` | 1 — features | `geom_features_for_seg` (one source of truth, builder + inference) → 21-D per-cell vector; CLI builder → `geom_*.npz`; QC overlay |
+| `ihc_ohc_geom_clf.py` | 2 — model + fusion | `rule` / `cv` / `train` / `sweep` / `fuse` / `predict` |
+| `ihc_ohc_geom_config.yaml` | — | all geom + fusion hyperparameters |
+
+## The signal
+
+The cochlea is long and thin: PC1 of the centroids runs along its length,
+PC2 across the IHC-row + 3-OHC-row band. Fit the across-coordinate as a
+**low-degree polynomial of the along-coordinate** (a regression centerline,
+*not* an interpolating spline — a spline threads the 4-row band and sits
+≈0 px from every cell, destroying the signal). The residual `w − g(t)` is
+the across-band offset, and it alone separates IHC from OHC at ≈**0.998**
+per image. The remaining 20 features (shape via `skimage.regionprops`,
+kNN-graph spacing/anisotropy, hull-edge proximity) sharpen the boundary
+and feed the learned model.
+
+## Feature groups (21-D, names in `FEATURE_NAMES`)
+
+- **shape** — area, perimeter, eccentricity, solidity, extent, axis
+  lengths, axis ratio, equiv. diameter. Sizes ÷ per-image median cell
+  diameter `D` → magnification-invariant.
+- **axis** — signed across-band offset (the key feature), |offset|,
+  along-position, tangent angle, cell-orientation-vs-axis, curvature.
+- **nbr** — mean/min kNN distance, count within 2·D, neighbour-offset
+  **anisotropy** (single-file IHC row ≈1, OHC band lower), mean offset of
+  the k neighbours.
+- **edge** — distance to the convex hull of all centroids (a
+  no-annotation tissue-edge proxy; secondary).
+
+Every cell also carries a **`flag`** bitmask (off-axis outlier, sparse
+neighbourhood, cochlear-end extrapolation, too-few-cells / fold) — emit
+for human review; flagged regions are exactly where fusion earns its keep.
+
+## Modes
+
+- **`rule`** — *zero training step*: per image, a 2-component GMM on the
+  signed offset; the minority component is IHC (~1:3 prior). Fully
+  deterministic. **Held-out test bal_acc 0.873** with no fit anywhere —
+  the design note's headline advantage, and a sanity oracle.
+- **`cv` / `train`** — `logreg` (default) or `gbm`, class-balanced,
+  GroupKFold **by source image** (same protocol & metrics as the CNN).
+- **`fuse`** — reads the CNN's `class_prob` from the segs, generates geom
+  probs **out-of-fold** (model refit per fold → honest estimate), picks
+  the fusion weight on OOF, freezes it, scores the held-out test, and runs
+  a **McNemar** test of fused-vs-CNN.
+
+## Result on the Cunningham held-out test set (1427 cells)
+
+| Config | acc | bal_acc | IHC rec | OHC rec | macro-F1 |
+|---|---|---|---|---|---|
+| CNN alone | 0.929 | 0.945 | 0.977 | 0.914 | 0.911 |
+| geom alone (logreg, CV 0.976 ± 0.009) | 0.963 | 0.962 | 0.960 | 0.964 | 0.951 |
+| **CNN ⊕ geom (mean, w=0.5)** | **0.980** | **0.981** | **0.983** | **0.980** | **0.974** |
+
+Geom alone already beats the CNN; fusion lifts **every** metric with no
+trade-off. McNemar fused-vs-CNN on the test set: 78 cells fixed vs 5 lost,
+χ²=62.5, **p ≈ 3e-15** — the gain is real, not noise. The CNN's weak spot
+(OHC recall 0.914) is exactly what the geometry repairs (→ 0.980).
+
+## Dependencies
+
+Beyond the cellpose env, `ihc_ohc_geom.py` needs **scikit-image**
+(`regionprops`; newly installed in the container) + scipy (already
+present); `ihc_ohc_geom_clf.py` needs scikit-learn (already required for
+the CNN's `GroupKFold`). **No torch** — the geometric stack stays light;
+the small metric/split/config helpers are intentionally duplicated from
+`ihc_ohc_classifier.py` (its copy is canonical — keep in sync) so the geom
+path never imports torch.
+
+## Usage (inside the cellpose container)
+
+```bash
+# 1. build geom tables (image-level split implicit: train/ vs test/)
+python3 /helpers/ihc_ohc_geom.py \
+    --data_dir /data/.../traintest/train \
+    --out /helpers/geom_train.npz --preview /helpers/geom_train_preview.png
+python3 /helpers/ihc_ohc_geom.py \
+    --data_dir /data/.../traintest/test --out /helpers/geom_test.npz
+
+# 2. training-free baseline / cross-validate / train the learned model
+python3 /helpers/ihc_ohc_geom_clf.py rule  --config /helpers/ihc_ohc_geom_config.yaml
+python3 /helpers/ihc_ohc_geom_clf.py cv    --config /helpers/ihc_ohc_geom_config.yaml
+python3 /helpers/ihc_ohc_geom_clf.py train --config /helpers/ihc_ohc_geom_config.yaml
+
+# 3. write the CNN's class_prob into the segs (prereq for fusion), then fuse
+python3 /helpers/ihc_ohc_classifier.py predict \
+    --ckpt /helpers/ihc_ohc_run/best.pt --seg <each _seg.npy> --write
+python3 /helpers/ihc_ohc_geom_clf.py fuse  --config /helpers/ihc_ohc_geom_config.yaml
+
+# 4. score one seg, write geom + fused decisions back (non-destructive)
+python3 /helpers/ihc_ohc_geom_clf.py predict \
+    --geom_ckpt /helpers/ihc_ohc_geom_run/geom_best.pkl \
+    --fuse_ckpt /helpers/ihc_ohc_geom_run/fuse.pkl --fuse \
+    --seg /data/.../000_..._seg.npy --write
+```
+
+`predict` writes `class_map_geom` / `class_prob_geom` / `geom_flag` (and,
+with `--fuse`, `class_map_fused`) into the seg dict, leaving `masks` and
+the CNN's keys untouched — same non-destructive convention, so
+`plot_boxes.py` and the GUI keep working.
+
+## Knobs
+
+Geom builder (`ihc_ohc_geom.py`, CLI):
+
+| Flag | Default | Note |
+|---|---|---|
+| `--k_neighbors` | 6 | k for the neighbour-graph features |
+| `--include-augmented` | off | also use augment.py's D4 copies |
+| `--preview` | — | per-image QC overlay PNG |
+
+Geom classifier / fusion (`ihc_ohc_geom_config.yaml`):
+
+| Key | Default | Note |
+|---|---|---|
+| `model.type` | logreg | `logreg` \| `gbm` |
+| `model.class_weight` | balanced | don't sacrifice the ~1:3 minority IHC |
+| `model.k_neighbors` | 6 | **must match** the builder |
+| `fuse.method` | mean | `mean` (1 CV-picked weight) \| `stack` (logreg) |
+| `fuse.geom_source` | model | `model` (learned, OOF) \| `rule` (training-free) |
+| `cv.folds` / `cv.val_frac` | 5 / 0.2 | GroupKFold by image |
+| `sweep.<model key>` | — | list of candidates → CV-scored grid |
+
+## Why this over early fusion
+
+Late fusion (Path A) doesn't perturb the tuned CNN recipe, validates
+independently, and already clears 0.98. Concatenating geom features into
+`TinyHCNet`'s embedding (Path B) would need a fresh sweep for a likely
+smaller marginal gain — deferred unless a single combined model is
+required for deployment.

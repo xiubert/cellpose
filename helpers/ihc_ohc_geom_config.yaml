@@ -1,0 +1,53 @@
+# Geometric IHC/OHC classifier + CNN-fusion config — single source of
+# truth for every geom run (parallels ihc_ohc_config.yaml).
+#
+# Drivers (each: --config /helpers/ihc_ohc_geom_config.yaml):
+#   rule   training-free GMM baseline on signed perp distance (no fit)
+#   cv     GroupKFold-by-image CV of the learned model
+#   train  one image-level split → pickled model + held-out test report
+#   sweep  CV-scores the `sweep:` grid → ranked leaderboard
+#   fuse   CNN ⊕ geom late fusion (the headline) + McNemar vs CNN-alone
+#
+# Partial file is fine (missing keys fall back to DEFAULT_CONFIG in
+# ihc_ohc_geom_clf.py); unknown keys are rejected; the resolved config is
+# echoed at the top of every run. Paths are container paths
+# (/data = /media/DATA/Chris/cellpose2D, /helpers = the host helpers dir).
+
+data:
+  geom_train_npz: /helpers/geom_train.npz   # built by ihc_ohc_geom.py
+  geom_test_npz:  /helpers/geom_test.npz    # null → skip the test report
+  # `fuse` reads the CNN's class_prob straight from the seg files (aligned
+  # per cell id), so it needs the seg dirs, not the geom npz. Run the CNN
+  # `predict --write` over these dirs first so class_prob is present.
+  seg_train_dir: /data/to_zip/hcat-data/Confocal/Cunningham/traintest/train
+  seg_test_dir:  /data/to_zip/hcat-data/Confocal/Cunningham/traintest/test
+  out_dir:       /helpers/ihc_ohc_geom_run  # geom_best.pkl, fuse.pkl, *.json
+
+model:
+  type:          logreg     # logreg | gbm
+  class_weight:  balanced   # mirror the CNN's bal_acc-first stance (don't
+                            #   sacrifice the ~1:3 minority IHC)
+  C:             1.0        # logreg inverse-regularisation strength
+  n_estimators:  300        # gbm only
+  max_depth:     3          # gbm only
+  learning_rate: 0.05       # gbm only
+  k_neighbors:   6          # MUST match the value passed to ihc_ohc_geom.py
+  seed:          0
+
+fuse:
+  method:      mean         # mean (1 CV-picked weight) | stack (logreg on [p_cnn,p_geom])
+  weight_grid: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+                            #   w = CNN share; (1-w) on geom. Picked on OOF.
+  geom_source: model        # model (learned, out-of-fold) | rule (training-free)
+
+cv:
+  folds:    5               # >=2 → GroupKFold by source image; <=1 → single split
+  val_frac: 0.2             # used only when folds <= 1
+
+# Hyperparameter sweep. Any model.* key → a list of candidates; `sweep`
+# runs the cartesian product, each CV-scored, and prints a leaderboard.
+# Empty {} = no sweep. Example (uncomment to use):
+sweep: {}
+#sweep:
+#  type: [logreg, gbm]
+#  C:    [0.3, 1.0, 3.0]
