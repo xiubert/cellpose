@@ -74,7 +74,10 @@ from sklearn.mixture import GaussianMixture
 from sklearn.model_selection import GroupKFold
 from sklearn.preprocessing import StandardScaler
 
-from ihc_ohc_crops import CLASS_NAMES, iter_seg_files, resolve_class_map, seg_stem
+from ihc_ohc_crops import (
+    CLASS_NAMES, extract_cell_crop, iter_seg_files, load_image_plane,
+    resolve_class_map, seg_stem, tif_for_seg,
+)
 from ihc_ohc_geom import (
     FEATURE_NAMES, geom_features_for_seg, load_geom_npz,
 )
@@ -88,10 +91,13 @@ DEFAULT_CONFIG = {
     "data": {
         "geom_train_npz": "/helpers/geom_train.npz",
         "geom_test_npz": "/helpers/geom_test.npz",
-        # seg dirs are only needed by `fuse` (it reads the CNN's class_prob
-        # straight from the seg files, aligned per cell id).
+        # `fuse` works at the seg-file level (aligns geom & CNN per cell id).
         "seg_train_dir": "/data/to_zip/hcat-data/Confocal/Cunningham/traintest/train",
         "seg_test_dir": "/data/to_zip/hcat-data/Confocal/Cunningham/traintest/test",
+        # the CNN side of fusion: its train config (for the OOF retrain) and
+        # the crops .npz (only its `meta`, for matching crop geometry).
+        "cnn_config": "/helpers/ihc_ohc_config.yaml",
+        "crops_train_npz": "/helpers/crops_train.npz",
         "out_dir": "/helpers/ihc_ohc_geom_run",
     },
     "model": {
@@ -109,6 +115,13 @@ DEFAULT_CONFIG = {
         "weight_grid": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5,
                         0.6, 0.7, 0.8, 0.9, 1.0],  # w = CNN share
         "geom_source": "model",    # model (learned, OOF) | rule (training-free)
+        "cnn_oof": True,           # True  → retrain the CNN per fold for
+                                   #   leak-free train-set probs (correct;
+                                   #   the weight/stacker is then chosen on
+                                   #   an honest signal). Slow: one CNN per
+                                   #   fold. False → read the deployed CNN's
+                                   #   class_prob from the train segs
+                                   #   (in-sample, biased — diagnostics only).
     },
     "cv": {"folds": 5, "val_frac": 0.2},
     "sweep": {},  # any model.* key → list of candidates, CV-scored
@@ -276,6 +289,21 @@ def rule_proba_ihc(feats, groups, *, ihc_prior=0.25):
 
 # ── per-seg assembly (for fuse / predict: aligns geom with the CNN) ──────────────
 
+def _crop_params(crops_npz):
+    """CNN crop geometry from the crops .npz `meta` (the authoritative
+    record of how the CNN was cropped). Only `meta` is touched — np.load
+    is lazy, so the big `crops` array is never decompressed."""
+    d = np.load(crops_npz, allow_pickle=True)
+    m = d["meta"][0] if "meta" in d else {}
+    m = m if isinstance(m, dict) else dict(m)
+    return dict(out_size=int(m.get("out_size", 64)),
+                pad_frac=float(m.get("pad_frac", 0.5)),
+                pad_px=m.get("pad_px"),
+                pad_value=m.get("pad_value", "mean"),
+                soft_mask=bool(m.get("soft_mask", True)),
+                channel=int(m.get("channel", 1)))
+
+
 def _cnn_pihc(seg, cid):
     """P(IHC) for one cell from the CNN keys the classifier wrote.
 
@@ -291,20 +319,26 @@ def _cnn_pihc(seg, cid):
 
 
 def assemble_segs(seg_dir, *, k_neighbors, need_cnn, need_gt,
+                  with_crops=False, crop_params=None,
                   include_augmented=False):
     """Walk seg_dir → aligned per-cell arrays.
 
     Returns dict with feats, p_cnn (P(IHC) or nan), y (or -1), groups,
-    flags, and a (image_name, cell_id) ref per row. `need_cnn` keeps only
-    cells the CNN scored; `need_gt` only labelled cells (eval). Used by
-    fuse (need both) and predict (neither — score every cell).
+    flags, a (image_name, cell_id) ref per row, and — when `with_crops` —
+    the CNN crop (2,S,S) per row, extracted with the *same* geometry the
+    CNN was trained on (`crop_params`) so the OOF-CNN retrain sees inputs
+    identical to deployment. `need_cnn` keeps only cells the deployed CNN
+    scored; `need_gt` only labelled cells. Every kept array stays index-
+    aligned (a cell is dropped from *all* of them or none).
     """
-    F, PC, Y, G, FL, REF = [], [], [], [], [], []
+    F, PC, Y, G, FL, REF, CR = [], [], [], [], [], [], []
     gi = {}
     n_missing_cnn = 0
+    cp = crop_params or {}
     for seg_path, gkey in iter_seg_files(seg_dir, include_augmented):
         seg = np.load(seg_path, allow_pickle=True).item()
-        if seg.get("masks") is None:
+        masks = seg.get("masks")
+        if masks is None:
             continue
         gt = {}
         if need_gt:
@@ -315,6 +349,12 @@ def assemble_segs(seg_dir, *, k_neighbors, need_cnn, need_gt,
             seg, k_neighbors=k_neighbors)
         if not cids:
             continue
+        plane = fill = None
+        if with_crops:
+            plane = load_image_plane(seg, tif_for_seg(seg_path),
+                                     cp.get("channel", 1))
+            pv = cp.get("pad_value", "mean")
+            fill = float(plane.mean()) if pv == "mean" else float(pv)
         name = seg_stem(seg_path)
         if gkey not in gi:
             gi[gkey] = len(gi)
@@ -326,6 +366,15 @@ def assemble_segs(seg_dir, *, k_neighbors, need_cnn, need_gt,
             if need_cnn and pc is None:
                 n_missing_cnn += 1
                 continue
+            crop = None
+            if with_crops:
+                crop = extract_cell_crop(
+                    plane, masks, int(cid), out_size=cp["out_size"],
+                    pad_frac=cp["pad_frac"], pad_px=cp["pad_px"],
+                    pad_value=fill, soft_mask=cp["soft_mask"])
+                if crop is None:        # mask erased upstream → drop the row
+                    continue
+                CR.append(crop)
             F.append(f)
             PC.append(np.nan if pc is None else pc)
             Y.append({"IHC": IHC, "OHC": OHC}[gt[cid]] if cid in gt else -1)
@@ -342,7 +391,8 @@ def assemble_segs(seg_dir, *, k_neighbors, need_cnn, need_gt,
     return dict(feats=np.stack(F).astype(np.float32),
                 p_cnn=np.asarray(PC, float), y=np.asarray(Y, np.int64),
                 groups=np.asarray(G, np.int64), flags=np.asarray(FL, np.int64),
-                ref=REF)
+                ref=REF,
+                crops=np.stack(CR).astype(np.float32) if with_crops else None)
 
 
 # ── cv / train (learned geom model alone) ───────────────────────────────────────
@@ -363,6 +413,50 @@ def oof_geom(feats, y, groups, mcfg, splits):
     for tr, va in splits:
         model = fit_geom(feats[tr], y[tr], mcfg)
         p[va] = proba_ihc(model, feats[va])
+    return p
+
+
+def oof_cnn(crops, y, groups, splits, cfg):
+    """Out-of-fold P(IHC) from the CNN — the *correctness* fix for fusion.
+
+    The deployed CNN (best.pt) is trained on the whole train set, so its
+    class_prob on training cells is in-sample: selecting the fusion
+    weight/stacker against it over-trusts the CNN and the train-side
+    rows are inflated. Here the CNN is retrained per outer fold (with a
+    nested image-level split inside the fold-train for early stopping) and
+    predicts only the held-out fold — exactly the leak-free protocol
+    `oof_geom` uses, on the *same* `splits`, so the two OOF signals are
+    jointly honest and aligned. The held-out *test* path is unaffected
+    (it rightly uses the deployed best.pt — test was never seen).
+
+    Slow by design: one CNN training per fold. torch + the classifier are
+    imported lazily so `rule`/`cv`/`train`/`predict` stay torch-free.
+    """
+    import torch
+
+    from ihc_ohc_classifier import TinyHCNet
+    from ihc_ohc_classifier import fit as cnn_fit
+    from ihc_ohc_classifier import load_config as cnn_load_config
+    from ihc_ohc_classifier import predict_crops
+
+    tcfg = cnn_load_config(cfg["data"]["cnn_config"])["train"]
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    p = np.full(len(y), np.nan)
+    for k, (tr, va) in enumerate(splits, 1):
+        # nest a held-out sub-val *inside* the fold-train (by image) for the
+        # CNN's early stopping, so the fold-val stays fully untouched.
+        es_tr_m, es_va_m = group_split(groups[tr], cfg["cv"]["val_frac"],
+                                       tcfg["seed"])
+        cnn_tr, cnn_es = tr[es_tr_m], tr[es_va_m]
+        r = cnn_fit(crops, y, cnn_tr, cnn_es, tcfg, device, verbose=False)
+        model = TinyHCNet(in_ch=crops.shape[1]).to(device)
+        model.load_state_dict(r["best_state"])
+        _, probs = predict_crops(model, crops[va], r["mean"], r["std"],
+                                 device)
+        p[va] = probs[:, IHC]
+        print(f"  CNN OOF fold {k}/{len(splits)}: train {len(cnn_tr)} / "
+              f"es {len(cnn_es)} cells → predicted {len(va)} "
+              f"(CNN best ep {r['best_ep']})", flush=True)
     return p
 
 
@@ -485,19 +579,28 @@ def _fuse_mean(p_cnn, p_geom, w):
 def fuse(cfg):
     """CNN ⊕ geom late fusion, honestly estimated.
 
-    Geom probs are out-of-fold (model refit per fold, or the training-free
-    rule). The fusion weight (mean) / stacker (logreg) is picked on the
-    same OOF predictions, then frozen and applied to the held-out test set.
-    Reports CNN-alone vs geom-alone vs fused + a McNemar of fused-vs-CNN.
+    *Both* train-side signals are out-of-fold on the same `splits`: geom
+    refit per fold (`oof_geom`), CNN retrained per fold (`oof_cnn`, when
+    `fuse.cnn_oof`). The fusion weight (mean) / stacker (logreg) is picked
+    on those jointly-honest OOF predictions, frozen, then applied to the
+    held-out test set — where the *deployed* best.pt is rightly used (test
+    was never seen). Reports CNN/geom/fused + a McNemar of fused-vs-CNN.
     """
     mcfg, fcfg = cfg["model"], cfg["fuse"]
     out_dir = cfg["data"]["out_dir"]
     os.makedirs(out_dir, exist_ok=True)
     kN = mcfg["k_neighbors"]
+    cnn_oof = bool(fcfg.get("cnn_oof", True))
 
     print(f"assembling train segs ({cfg['data']['seg_train_dir']}) …")
-    tr = assemble_segs(cfg["data"]["seg_train_dir"], k_neighbors=kN,
-                       need_cnn=True, need_gt=True)
+    if cnn_oof:
+        cp = _crop_params(cfg["data"]["crops_train_npz"])
+        tr = assemble_segs(cfg["data"]["seg_train_dir"], k_neighbors=kN,
+                           need_cnn=False, need_gt=True,
+                           with_crops=True, crop_params=cp)
+    else:
+        tr = assemble_segs(cfg["data"]["seg_train_dir"], k_neighbors=kN,
+                           need_cnn=True, need_gt=True)
     print(f"  {len(tr['y'])} cells, {len(np.unique(tr['groups']))} images")
     splits = _splits(tr["groups"], cfg, mcfg["seed"])
 
@@ -506,7 +609,15 @@ def fuse(cfg):
         pg = rule_proba_ihc(tr["feats"], tr["groups"])
     else:
         pg = oof_geom(tr["feats"], tr["y"], tr["groups"], mcfg, splits)
-    pc, y = tr["p_cnn"], tr["y"]
+    # out-of-fold (honest) or in-sample (biased, diagnostics-only) CNN P(IHC)
+    if cnn_oof:
+        print(f"computing OOF CNN — retraining {len(splits)} CNNs (the "
+              f"slow, honest path) …", flush=True)
+        pc = oof_cnn(tr["crops"], tr["y"], tr["groups"], splits, cfg)
+    else:
+        pc = tr["p_cnn"]
+    y = tr["y"]
+    tlbl = "OOF train" if cnn_oof else "in-sample train, BIASED"
 
     def report(tag, p):
         cm = cm_from(y, np.where(p >= 0.5, IHC, OHC))
@@ -516,7 +627,7 @@ def fuse(cfg):
               f"f1 {m['macro_f1']:.4f}")
         return cm, m
 
-    _, m_cnn = report("CNN alone (OOF train)", pc)
+    _, m_cnn = report(f"CNN alone ({tlbl})", pc)
     report("geom alone (OOF train)", pg)
 
     fused_cfg = {}
@@ -546,7 +657,7 @@ def fuse(cfg):
         print(f"\nchosen CNN weight w={best_w:.2f} "
               f"(1-w on geom), OOF bal_acc {best_b:.4f}")
 
-    _, m_fused = report(f"FUSED ({fcfg['method']}, OOF train)", p_fused)
+    _, m_fused = report(f"FUSED ({fcfg['method']}, {tlbl})", p_fused)
     b, c, st, pval = mcnemar(y, np.where(pc >= 0.5, IHC, OHC),
                              np.where(p_fused >= 0.5, IHC, OHC))
     print(f"\nMcNemar fused-vs-CNN: CNN-only-right={b}  fused-only-right={c}  "
@@ -555,8 +666,8 @@ def fuse(cfg):
           f"({'gain' if c > b else 'no gain'})")
 
     ckpt = dict(fuse=fused_cfg, geom_source=fcfg["geom_source"],
-                model_cfg=mcfg, k_neighbors=kN,
-                cnn_oof=m_cnn, fused_oof=m_fused, mcnemar=dict(
+                model_cfg=mcfg, k_neighbors=kN, cnn_oof=cnn_oof,
+                cnn_train=m_cnn, fused_train=m_fused, mcnemar=dict(
                     b=b, c=c, chi2=st, p=pval))
     ckpt_path = os.path.join(out_dir, "fuse.pkl")
     with open(ckpt_path, "wb") as fh:

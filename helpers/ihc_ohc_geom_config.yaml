@@ -16,12 +16,16 @@
 data:
   geom_train_npz: /helpers/geom_train.npz   # built by ihc_ohc_geom.py
   geom_test_npz:  /helpers/geom_test.npz    # null → skip the test report
-  # `fuse` reads the CNN's class_prob straight from the seg files (aligned
-  # per cell id), so it needs the seg dirs, not the geom npz. Run the CNN
-  # `predict --write` over these dirs first so class_prob is present.
+  # `fuse` works at the seg-file level (aligns geom & CNN per cell id).
   seg_train_dir: /data/to_zip/hcat-data/Confocal/Cunningham/traintest/train
   seg_test_dir:  /data/to_zip/hcat-data/Confocal/Cunningham/traintest/test
-  out_dir:       /helpers/ihc_ohc_geom_run  # geom_best.pkl, fuse.pkl, *.json
+  # CNN side of fusion: its train config (used to retrain the CNN per fold
+  # for leak-free OOF probs) and the crops npz (only its `meta`, to match
+  # crop geometry). The held-out test still uses the deployed best.pt, so
+  # run the CNN `predict --write` over seg_test_dir before `fuse`.
+  cnn_config:      /helpers/ihc_ohc_config.yaml
+  crops_train_npz: /helpers/crops_train.npz
+  out_dir:         /helpers/ihc_ohc_geom_run  # geom_best.pkl, fuse.pkl, *.json
 
 model:
   type:          logreg     # logreg | gbm
@@ -39,6 +43,11 @@ fuse:
   weight_grid: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
                             #   w = CNN share; (1-w) on geom. Picked on OOF.
   geom_source: model        # model (learned, out-of-fold) | rule (training-free)
+  cnn_oof:     true         # true  → retrain the CNN per fold so the train
+                            #   probs are leak-free and w/stacker selection
+                            #   is honest (slow: one CNN per fold). false →
+                            #   read the deployed CNN's in-sample class_prob
+                            #   from the train segs (biased; diagnostics only)
 
 cv:
   folds:    5               # >=2 → GroupKFold by source image; <=1 → single split
