@@ -344,6 +344,34 @@ Geom classifier / fusion (`ihc_ohc_geom_config.yaml`):
 | `cv.folds` / `cv.val_frac` | 5 / 0.2 | GroupKFold by image |
 | `sweep.<model key>` | — | list of candidates → CV-scored grid |
 
+## End-to-end orchestrator
+
+`ihc_ohc_pipeline.py` is a thin driver over the CLIs above (each module
+stays the single source of truth; it only adds the batched CNN
+write-back and the plot).
+
+```bash
+DATA=/data/to_zip/hcat-data/Confocal/Cunningham/traintest
+
+# A. train everything (crops→CNN→geom table→geom→CNN write-back→fuse)
+python3 /helpers/ihc_ohc_pipeline.py train \
+    --train_dir $DATA/train --test_dir $DATA/test
+
+# B. score one image (or a whole dir) with the full stack, write back
+python3 /helpers/ihc_ohc_pipeline.py predict --seg $DATA/test/009_..._seg.npy
+python3 /helpers/ihc_ohc_pipeline.py predict --dir $DATA/test
+
+# C. plot masks tinted by class (source: fused | geom | cnn | gt)
+python3 /helpers/ihc_ohc_pipeline.py plot \
+    --seg $DATA/test/009_..._seg.npy --source fused
+```
+
+`predict` writes `class_map_pred`/`class_prob` (CNN),
+`class_map_geom`/`class_prob_geom`/`geom_flag`, and `class_map_fused`
+into the seg, non-destructively. `plot` renders the MYO7A image with
+each mask tinted IHC (red) / OHC (blue), geometry-flagged cells ringed,
+and the vs-GT accuracy in the title → PNG next to the seg.
+
 ## Why this over early fusion
 
 Late fusion (Path A) doesn't perturb the tuned CNN recipe, validates
