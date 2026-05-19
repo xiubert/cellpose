@@ -47,7 +47,9 @@ cv:
 # Hyperparameter sweep. Any model.* key → a list of candidates; `sweep`
 # runs the cartesian product, each CV-scored, and prints a leaderboard.
 # Empty {} = no sweep. Example (uncomment to use):
+# Empty {} = no sweep. Ran type×C (see ihc_ohc.md): gbm ≈ logreg within
+# noise, logreg lower-variance + interpretable → kept as the default.
 sweep: {}
 #sweep:
 #  type: [logreg, gbm]
-#  C:    [0.3, 1.0, 3.0]
+#  C:    [0.1, 0.3, 1.0, 3.0, 10.0]

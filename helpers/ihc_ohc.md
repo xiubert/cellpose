@@ -269,6 +269,17 @@ trade-off. McNemar fused-vs-CNN on the test set: 78 cells fixed vs 5 lost,
 χ²=62.5, **p ≈ 3e-15** — the gain is real, not noise. The CNN's weak spot
 (OHC recall 0.914) is exactly what the geometry repairs (→ 0.980).
 
+## Model choice (sweep)
+
+`type ∈ {logreg, gbm}` × `C ∈ {0.1, 0.3, 1, 3, 10}`, 5-fold
+GroupKFold-by-image: gbm 0.9788 ± 0.0144 vs best logreg 0.9768 ± 0.0093
+bal_acc — **tied within noise**, gbm ~50 % higher variance. Kept
+**logreg, C=1.0**: lower-variance, faster, and the only one with
+interpretable coefficients (which confirmed the biology). `C` is nearly
+flat for logreg; gbm ignores it (the 5 gbm rows are identical). Model
+choice barely matters anyway — fusion (0.945 → 0.981) is the real lever
+and is model-agnostic.
+
 ## Dependencies
 
 Beyond the cellpose env, `ihc_ohc_geom.py` needs **scikit-image**

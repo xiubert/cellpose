@@ -137,6 +137,7 @@ notes/
 backup/
 crops*
 ihc_ohc_run*
+ihc_ohc_geom_run*
 ihc_ohc_sweep*
 *.npz
 *_preview.png
