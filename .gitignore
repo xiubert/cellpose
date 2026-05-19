@@ -135,3 +135,6 @@ helpers/models
 old/
 notes/
 backup/
+crops*
+ihc_ohc_run*
+ihc_ohc_sweep*

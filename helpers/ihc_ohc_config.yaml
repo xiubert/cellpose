@@ -1,0 +1,48 @@
+# IHC/OHC classifier config — single source of truth for every run.
+#
+# Used by all three drivers (each: --config /helpers/ihc_ohc_config.yaml):
+#   sweep  CV-scores every point in the `sweep:` grid → ranked leaderboard
+#   cv     GroupKFold cross-validation with the `train:` values as-is
+#   train  one image-level split → checkpoint + held-out test report
+#
+# A partial file is fine: anything omitted falls back to DEFAULT_CONFIG in
+# ihc_ohc_classifier.py. Unknown keys are rejected (typo guard). The fully
+# resolved config is echoed at the top of every run.
+#
+# Paths are container paths (/data = /media/DATA/Chris/cellpose2D,
+# /helpers = the host helpers dir).
+
+data:
+  train_npz: /helpers/crops_train.npz
+  test_npz:  /helpers/crops_test.npz     # null → skip the test report in `train`
+  out_dir:   /helpers/ihc_ohc_run        # best.pt, history.json, *_results.json
+
+train:
+  epochs:        40        # cosine horizon — match to a realistic run length
+  batch_size:    256       # GroupNorm is batch-insensitive; 256 smooths the curve
+  lr:            0.002     # sweep winner (ce/none monotone in lr; 3-fold CV)
+  weight_decay:  0.0001
+  warmup_epochs: 4         # linear LR warmup before cosine decay
+  select_ema:    0.5       # EMA factor for the selection metric; 0 = raw bal_acc
+  sampler:       balanced  # balanced (~50/50 batches) | random
+  loss:          ce        # ce | focal
+  focal_gamma:   1.5       # used only when loss: focal
+  class_weight:  none      # none | balanced — leave 'none' with sampler: balanced
+  patience:      15        # early stop after N epochs w/o smoothed-bal_acc gain
+  workers:       0          # keep 0 in the cellpose container: its /dev/shm is
+                            # 63 MB, too small for DataLoader worker IPC (the
+                            # crops are already in RAM, so 0 is also fast)
+  seed:          0
+
+cv:
+  folds:    5              # >=2 → GroupKFold by source image; <=1 → single split
+  val_frac: 0.2            # used only when folds <= 1
+
+# Hyperparameter sweep. Any train.* key → a list of candidates; `sweep`
+# runs the cartesian product, each scored by `folds`-fold CV, and prints a
+# leaderboard. Empty {} means no sweep. Example (uncomment to use):
+sweep: {}
+#sweep:
+#  lr:           [0.0005, 0.001, 0.002]
+#  loss:         [ce, focal]
+#  select_ema:   [0.3, 0.5, 0.7]
