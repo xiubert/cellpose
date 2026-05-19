@@ -251,10 +251,14 @@ for human review; flagged regions are exactly where fusion earns its keep.
   the design note's headline advantage, and a sanity oracle.
 - **`cv` / `train`** — `logreg` (default) or `gbm`, class-balanced,
   GroupKFold **by source image** (same protocol & metrics as the CNN).
-- **`fuse`** — reads the CNN's `class_prob` from the segs, generates geom
-  probs **out-of-fold** (model refit per fold → honest estimate), picks
-  the fusion weight on OOF, freezes it, scores the held-out test, and runs
-  a **McNemar** test of fused-vs-CNN.
+- **`fuse`** — generates *both* train signals **out-of-fold on the same
+  splits**: geom refit per fold (`oof_geom`) and the **CNN retrained per
+  fold** with a nested image-level sub-val for early stopping (`oof_cnn`,
+  default `fuse.cnn_oof: true`). The fusion weight (mean) / stacker
+  (logreg) is picked on those jointly-honest OOF predictions, frozen, then
+  applied to the held-out test set — where the deployed `best.pt` is
+  rightly used (test was never seen). McNemar fused-vs-CNN. Slow by
+  design: one CNN training per fold.
 
 ## Result on the Cunningham held-out test set (1427 cells)
 
@@ -268,6 +272,17 @@ Geom alone already beats the CNN; fusion lifts **every** metric with no
 trade-off. McNemar fused-vs-CNN on the test set: 78 cells fixed vs 5 lost,
 χ²=62.5, **p ≈ 3e-15** — the gain is real, not noise. The CNN's weak spot
 (OHC recall 0.914) is exactly what the geometry repairs (→ 0.980).
+
+**Audit / OOF-CNN validation.** An earlier version of `fuse` read the
+deployed CNN's `class_prob` straight from the train segs to pick the
+fusion weight — those probs are *in-sample* (the CNN was trained on those
+cells). Switching to honest per-fold CNN retraining (`fuse.cnn_oof: true`,
+the default) drops the train-side CNN estimate from bal_acc **0.949
+(in-sample) → 0.924 (OOF)** — the ~2.5 pt of optimism the audit
+predicted. The selected weight stays **w = 0.50** even against the
+honest, weaker train signal, so the deployed pipeline and the
+held-out test (0.945 / 0.962 / **0.981**) are unchanged: the 0.98 was
+robust to the bias, not an artifact of it.
 
 ## Model choice (sweep)
 
