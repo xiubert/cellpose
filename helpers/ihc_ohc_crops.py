@@ -101,6 +101,68 @@ def tif_for_seg(seg_path):
     return os.path.join(os.path.dirname(seg_path), f"{seg_stem(seg_path)}.tif")
 
 
+# ── prediction sidecar (don't mutate the dataset) ───────────────────────────────
+
+# Every key produced downstream of segmentation: classifier (CNN), geom,
+# and fusion. The sidecar is the single source of truth for these; the
+# `_seg.npy` dataset files stay untouched.
+PRED_KEYS = ("class_map_pred", "class_prob",
+             "class_map_geom", "class_prob_geom", "geom_flag",
+             "class_map_fused", "class_prob_fused")
+
+
+def pred_path(seg_path):
+    """'<stem>_seg.npy' → '<stem>_pred.npy' next to the seg."""
+    if seg_path.endswith("_seg.npy"):
+        return seg_path[:-len("_seg.npy")] + "_pred.npy"
+    base, _ = os.path.splitext(seg_path)
+    return base + "_pred.npy"
+
+
+def load_pred(seg_path, seg=None):
+    """Read the per-cell predictions for one seg.
+
+    Prefers the sidecar; falls back transparently to keys *inside* the seg
+    so segs written by earlier runs (when predictions were stored in-line)
+    keep working. Pass `seg` (already-loaded dict) to skip a disk read in
+    the fallback path. Returns {} if neither source has predictions.
+    """
+    pp = pred_path(seg_path)
+    if os.path.exists(pp):
+        try:
+            d = np.load(pp, allow_pickle=True).item()
+        except Exception:  # noqa: BLE001
+            d = {}
+        return d if isinstance(d, dict) else {}
+    if seg is None:
+        try:
+            seg = np.load(seg_path, allow_pickle=True).item()
+        except Exception:  # noqa: BLE001
+            return {}
+    return {k: seg[k] for k in PRED_KEYS if k in seg}
+
+
+def update_pred(seg_path, **new_keys):
+    """Merge prediction key/values into the sidecar (creating it if absent).
+
+    The dataset `_seg.npy` is **never** touched — that's the whole point.
+    Write is atomic-ish (tmp file + os.replace) so a crash mid-save can't
+    leave a half-written sidecar.
+    """
+    pp = pred_path(seg_path)
+    cur = {}
+    if os.path.exists(pp):
+        try:
+            cur = np.load(pp, allow_pickle=True).item() or {}
+        except Exception:  # noqa: BLE001
+            cur = {}
+    cur.update({k: v for k, v in new_keys.items() if v is not None})
+    tmp = pp + ".tmp"
+    np.save(tmp, cur, allow_pickle=True)
+    os.replace(tmp, pp)
+    return pp
+
+
 # ── image loading ──────────────────────────────────────────────────────────────
 
 def load_image_plane(seg, tif_path, channel=1):

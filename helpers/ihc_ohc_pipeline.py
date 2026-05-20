@@ -75,6 +75,7 @@ def cnn_predict_dir(ckpt, data_dir, *, include_augmented=False):
     from ihc_ohc_classifier import CLASS_NAMES, load_model, predict_crops
     from ihc_ohc_crops import (
         extract_cell_crop, iter_seg_files, load_image_plane, tif_for_seg,
+        update_pred,
     )
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -107,12 +108,13 @@ def cnn_predict_dir(ckpt, data_dir, *, include_augmented=False):
             continue
         pr, pb = predict_crops(model, np.stack(crops), ck["mean"],
                                ck["std"], dev)
-        seg["class_map_pred"] = {c: CLASS_NAMES[p] for c, p in zip(valid, pr)}
-        seg["class_prob"] = {c: float(pb_[p])
-                             for c, p, pb_ in zip(valid, pr, pb)}
-        np.save(sp, seg)
+        update_pred(
+            sp,
+            class_map_pred={c: CLASS_NAMES[p] for c, p in zip(valid, pr)},
+            class_prob={c: float(pb_[p])
+                        for c, p, pb_ in zip(valid, pr, pb)})
         n += 1
-    print(f"  CNN write-back: {n} segs in {data_dir}")
+    print(f"  CNN write-back: {n} sidecars (seg files untouched) in {data_dir}")
 
 
 # ── train: the full pipeline ────────────────────────────────────────────────────
@@ -195,21 +197,24 @@ def cmd_plot(args):
     import matplotlib.patches as mpatches
     import matplotlib.pyplot as plt
 
-    from ihc_ohc_crops import load_image_plane, resolve_class_map, tif_for_seg
+    from ihc_ohc_crops import (
+        load_image_plane, load_pred, resolve_class_map, tif_for_seg,
+    )
 
     seg = np.load(args.seg, allow_pickle=True).item()
     masks = seg["masks"]
     plane = load_image_plane(seg, tif_for_seg(args.seg))
+    pred = load_pred(args.seg, seg)
 
     key = _SOURCE_KEY[args.source]
     if args.source == "gt":
         cmap, _ = resolve_class_map(seg, args.seg, os.path.dirname(args.seg))
     else:
-        cmap = {int(k): v for k, v in (seg.get(key) or {}).items()}
+        cmap = {int(k): v for k, v in (pred.get(key) or {}).items()}
     if not cmap:
-        sys.exit(f"no '{key}' in {os.path.basename(args.seg)} — run "
+        sys.exit(f"no '{key}' for {os.path.basename(args.seg)} — run "
                  f"`ihc_ohc_pipeline.py predict` first (source={args.source})")
-    flags = {int(k): int(v) for k, v in (seg.get("geom_flag") or {}).items()}
+    flags = {int(k): int(v) for k, v in (pred.get("geom_flag") or {}).items()}
 
     # grayscale MYO7A background, robust percentile stretch.
     lo, hi = np.percentile(plane, (1, 99.5))

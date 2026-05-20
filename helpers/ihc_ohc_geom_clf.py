@@ -76,7 +76,7 @@ from sklearn.preprocessing import StandardScaler
 
 from ihc_ohc_crops import (
     CLASS_NAMES, extract_cell_crop, iter_seg_files, load_image_plane,
-    resolve_class_map, seg_stem, tif_for_seg,
+    load_pred, resolve_class_map, seg_stem, tif_for_seg, update_pred,
 )
 from ihc_ohc_geom import (
     FEATURE_NAMES, geom_features_for_seg, load_geom_npz,
@@ -304,18 +304,20 @@ def _crop_params(crops_npz):
                 channel=int(m.get("channel", 1)))
 
 
-def _cnn_pihc(seg, cid):
-    """P(IHC) for one cell from the CNN keys the classifier wrote.
+def _cnn_pihc(pred, cid):
+    """P(IHC) for one cell from a loaded sidecar (or seg-fallback) dict.
 
     `class_prob` is the prob of the *predicted* class; invert when the
-    prediction was OHC. None if the CNN never scored this cell.
+    prediction was OHC. None if the CNN never scored this cell. `pred`
+    comes from `load_pred(seg_path, seg)` — that function transparently
+    reads the sidecar when it exists and falls back to legacy in-seg keys.
     """
-    pred = seg.get("class_map_pred", {})
-    prob = seg.get("class_prob", {})
-    if cid not in pred or cid not in prob:
+    pm = pred.get("class_map_pred", {}) or {}
+    pp = pred.get("class_prob", {}) or {}
+    if cid not in pm or cid not in pp:
         return None
-    p = float(prob[cid])
-    return p if pred[cid] == "IHC" else 1.0 - p
+    p = float(pp[cid])
+    return p if pm[cid] == "IHC" else 1.0 - p
 
 
 def assemble_segs(seg_dir, *, k_neighbors, need_cnn, need_gt,
@@ -349,6 +351,7 @@ def assemble_segs(seg_dir, *, k_neighbors, need_cnn, need_gt,
             seg, k_neighbors=k_neighbors)
         if not cids:
             continue
+        pred = load_pred(seg_path, seg) if need_cnn else {}
         plane = fill = None
         if with_crops:
             plane = load_image_plane(seg, tif_for_seg(seg_path),
@@ -362,7 +365,7 @@ def assemble_segs(seg_dir, *, k_neighbors, need_cnn, need_gt,
         for cid, f, fl in zip(cids, feats, flags):
             if need_gt and cid not in gt:
                 continue
-            pc = _cnn_pihc(seg, cid)
+            pc = _cnn_pihc(pred, cid) if pred else None
             if need_cnn and pc is None:
                 n_missing_cnn += 1
                 continue
@@ -725,11 +728,13 @@ def predict_seg_geom(geom_ckpt, seg_path, *, fuse_ckpt=None, write=False):
     geom_prob = {int(c): float(max(p, 1 - p)) for c, p in zip(cids, pg)}
     flag_map = {int(c): int(f) for c, f in zip(cids, flags)}
 
-    fused_map = None
+    fused_map = fused_prob = None
     if fuse_ckpt:
         with open(fuse_ckpt, "rb") as fh:
             fk = pickle.load(fh)
-        pc = np.array([_cnn_pihc(seg, int(c)) for c in cids], float)
+        pred = load_pred(seg_path, seg)
+        pc = np.array([_cnn_pihc(pred, int(c)) if pred else None
+                       for c in cids], float)
         if np.isnan(pc).any():
             print("  fusion skipped: CNN class_prob missing for some cells "
                   "(run ihc_ohc_classifier.py predict --write first)")
@@ -744,6 +749,8 @@ def predict_seg_geom(geom_ckpt, seg_path, *, fuse_ckpt=None, write=False):
             fused_map = {int(c): (CLASS_NAMES[IHC] if p >= 0.5
                                   else CLASS_NAMES[OHC])
                          for c, p in zip(cids, pf)}
+            fused_prob = {int(c): float(max(p, 1 - p))
+                          for c, p in zip(cids, pf)}
 
     n_ihc = sum(v == "IHC" for v in geom_map.values())
     print(f"{os.path.basename(seg_path)}: {len(cids)} cells  "
@@ -761,15 +768,13 @@ def predict_seg_geom(geom_ckpt, seg_path, *, fuse_ckpt=None, write=False):
                 print(f"  {tag} vs GT [{src}]: acc {ok/tot:.4f} ({ok}/{tot})")
 
     if write:
-        seg["class_map_geom"] = geom_map
-        seg["class_prob_geom"] = geom_prob
-        seg["geom_flag"] = flag_map
-        if fused_map:
-            seg["class_map_fused"] = fused_map
-        np.save(seg_path, seg)
+        pp = update_pred(seg_path, class_map_geom=geom_map,
+                         class_prob_geom=geom_prob, geom_flag=flag_map,
+                         class_map_fused=fused_map,
+                         class_prob_fused=fused_prob)
         print(f"  wrote class_map_geom / class_prob_geom / geom_flag"
-              + (" / class_map_fused" if fused_map else "")
-              + f" → {os.path.basename(seg_path)}")
+              + (" / class_map_fused / class_prob_fused" if fused_map else "")
+              + f" → {os.path.basename(pp)} (sidecar; seg untouched)")
     return geom_map
 
 

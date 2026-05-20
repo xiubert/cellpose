@@ -58,7 +58,7 @@ from torchvision.transforms import functional as TF
 
 from ihc_ohc_crops import (
     CLASS_NAMES, extract_cell_crop, load_image_plane, resolve_class_map,
-    seg_stem, tif_for_seg,
+    seg_stem, tif_for_seg, update_pred,
 )
 
 
@@ -706,10 +706,12 @@ def predict_seg(ckpt_path, seg_path, *, write=False, device=None):
             print(f"  vs ground truth [{src}]: acc {ok/tot:.4f}  ({ok}/{tot})")
 
     if write:
-        seg["class_map_pred"] = {cid: v[0] for cid, v in result.items()}
-        seg["class_prob"] = {cid: v[1] for cid, v in result.items()}
-        np.save(seg_path, seg)
-        print(f"  wrote class_map_pred / class_prob → {os.path.basename(seg_path)}")
+        pp = update_pred(
+            seg_path,
+            class_map_pred={cid: v[0] for cid, v in result.items()},
+            class_prob={cid: v[1] for cid, v in result.items()})
+        print(f"  wrote class_map_pred / class_prob → "
+              f"{os.path.basename(pp)} (sidecar; seg untouched)")
     return result
 
 
