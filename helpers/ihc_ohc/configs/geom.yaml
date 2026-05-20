@@ -1,7 +1,7 @@
 # Geometric IHC/OHC classifier + CNN-fusion config — single source of
-# truth for every geom run (parallels ihc_ohc_config.yaml).
+# truth for every geom run (parallels configs/cnn.yaml).
 #
-# Drivers (each: --config /helpers/ihc_ohc_geom_config.yaml):
+# Drivers (each: --config /helpers/ihc_ohc/configs/geom.yaml):
 #   rule   training-free GMM baseline on signed perp distance (no fit)
 #   cv     GroupKFold-by-image CV of the learned model
 #   train  one image-level split → pickled model + held-out test report
@@ -10,12 +10,13 @@
 #
 # Partial file is fine (missing keys fall back to DEFAULT_CONFIG in
 # ihc_ohc_geom_clf.py); unknown keys are rejected; the resolved config is
-# echoed at the top of every run. Paths are container paths
-# (/data = /media/DATA/Chris/cellpose2D, /helpers = the host helpers dir).
+# echoed at the top of every run AND frozen as config.yaml inside the run
+# dir. Paths are container paths (/data = /media/DATA/Chris/cellpose2D,
+# /helpers = the host helpers dir).
 
 data:
-  geom_train_npz: /helpers/geom_train.npz   # built by ihc_ohc_geom.py
-  geom_test_npz:  /helpers/geom_test.npz    # null → skip the test report
+  geom_train_npz: /helpers/ihc_ohc/runs/cache/geom_train.npz   # built by ihc_ohc_geom.py
+  geom_test_npz:  /helpers/ihc_ohc/runs/cache/geom_test.npz    # null → skip the test report
   # `fuse` works at the seg-file level (aligns geom & CNN per cell id).
   seg_train_dir: /data/to_zip/hcat-data/Confocal/Cunningham/traintest/train
   seg_test_dir:  /data/to_zip/hcat-data/Confocal/Cunningham/traintest/test
@@ -23,9 +24,18 @@ data:
   # for leak-free OOF probs) and the crops npz (only its `meta`, to match
   # crop geometry). The held-out test still uses the deployed best.pt, so
   # run the CNN `predict --write` over seg_test_dir before `fuse`.
-  cnn_config:      /helpers/ihc_ohc_config.yaml
-  crops_train_npz: /helpers/crops_train.npz
-  out_dir:         /helpers/ihc_ohc_geom_run  # geom_best.pkl, fuse.pkl, *.json
+  cnn_config:      /helpers/ihc_ohc/configs/cnn.yaml
+  crops_train_npz: /helpers/ihc_ohc/runs/cache/crops_train.npz
+  # Root for run artifacts. Each train/sweep/fuse invocation gets a fresh
+  # timestamped subdir (e.g. 20260520-104530_train-geom/) with geom_best.pkl
+  # / fuse.pkl / test_report.json + frozen config.yaml.
+  out_dir:         /helpers/ihc_ohc/runs
+
+  # Deployed checkpoints, consumed by ihc_ohc_pipeline.py predict. Update
+  # after each train/fuse run to point at the new artifact; null = require
+  # the caller to pass --geom_ckpt / --fuse_ckpt on the CLI.
+  geom_ckpt: null
+  fuse_ckpt: null
 
 model:
   type:          logreg     # logreg | gbm

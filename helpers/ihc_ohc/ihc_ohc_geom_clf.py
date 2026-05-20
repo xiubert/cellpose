@@ -43,19 +43,29 @@ module remains their canonical version — keep them in sync.
 Dependencies (beyond the cellpose env): scikit-learn (already required for
 the CNN's GroupKFold), scipy, scikit-image. No torch.
 
+Every `train` / `sweep` / `fuse` writes to a fresh timestamped subdir
+under `data.out_dir` — e.g. runs/20260520-104530_train-geom/. The resolved
+config is frozen alongside as `config.yaml`. `--run_dir <path>` overrides
+the auto-stamp (the pipeline orchestrator uses this to keep all steps of
+one pipeline run under one timestamp).
+
 Usage (inside the cellpose container)
 -------------------------------------
-  python /helpers/ihc_ohc_geom.py --data_dir .../traintest/train --out /helpers/geom_train.npz
-  python /helpers/ihc_ohc_geom.py --data_dir .../traintest/test  --out /helpers/geom_test.npz
+  python /helpers/ihc_ohc/ihc_ohc_geom.py --data_dir .../traintest/train \
+      --out /helpers/ihc_ohc/runs/cache/geom_train.npz
+  python /helpers/ihc_ohc/ihc_ohc_geom.py --data_dir .../traintest/test  \
+      --out /helpers/ihc_ohc/runs/cache/geom_test.npz
 
-  python /helpers/ihc_ohc_geom_clf.py rule  --config /helpers/ihc_ohc_geom_config.yaml
-  python /helpers/ihc_ohc_geom_clf.py cv    --config /helpers/ihc_ohc_geom_config.yaml
-  python /helpers/ihc_ohc_geom_clf.py train --config /helpers/ihc_ohc_geom_config.yaml
+  python /helpers/ihc_ohc/ihc_ohc_geom_clf.py rule  --config /helpers/ihc_ohc/configs/geom.yaml
+  python /helpers/ihc_ohc/ihc_ohc_geom_clf.py cv    --config /helpers/ihc_ohc/configs/geom.yaml
+  python /helpers/ihc_ohc/ihc_ohc_geom_clf.py train --config /helpers/ihc_ohc/configs/geom.yaml
   # CNN probs must already be written into the segs:
   #   ihc_ohc_classifier.py predict --ckpt best.pt --seg <...>_seg.npy --write
-  python /helpers/ihc_ohc_geom_clf.py fuse  --config /helpers/ihc_ohc_geom_config.yaml
-  python /helpers/ihc_ohc_geom_clf.py predict --geom_ckpt /helpers/ihc_ohc_geom_run/geom_best.pkl \
-      --seg .../000_..._seg.npy --fuse --fuse_ckpt /helpers/ihc_ohc_geom_run/fuse.pkl --write
+  python /helpers/ihc_ohc/ihc_ohc_geom_clf.py fuse  --config /helpers/ihc_ohc/configs/geom.yaml
+  python /helpers/ihc_ohc/ihc_ohc_geom_clf.py predict \
+      --geom_ckpt /helpers/ihc_ohc/runs/<stamp>_train-geom/geom_best.pkl \
+      --seg .../000_..._seg.npy --fuse \
+      --fuse_ckpt /helpers/ihc_ohc/runs/<stamp>_fuse/fuse.pkl --write
 """
 
 import argparse
@@ -76,7 +86,8 @@ from sklearn.preprocessing import StandardScaler
 
 from ihc_ohc_crops import (
     CLASS_NAMES, extract_cell_crop, iter_seg_files, load_image_plane,
-    load_pred, resolve_class_map, seg_stem, tif_for_seg, update_pred,
+    load_pred, new_run_dir, resolve_class_map, save_run_config, seg_stem,
+    tif_for_seg, update_pred,
 )
 from ihc_ohc_geom import (
     FEATURE_NAMES, geom_features_for_seg, load_geom_npz,
@@ -89,16 +100,24 @@ IHC, OHC = 0, 1  # class indices, fixed (matches ihc_ohc_crops.CLASS_NAMES)
 
 DEFAULT_CONFIG = {
     "data": {
-        "geom_train_npz": "/helpers/geom_train.npz",
-        "geom_test_npz": "/helpers/geom_test.npz",
+        "geom_train_npz": "/helpers/ihc_ohc/runs/cache/geom_train.npz",
+        "geom_test_npz": "/helpers/ihc_ohc/runs/cache/geom_test.npz",
         # `fuse` works at the seg-file level (aligns geom & CNN per cell id).
         "seg_train_dir": "/data/to_zip/hcat-data/Confocal/Cunningham/traintest/train",
         "seg_test_dir": "/data/to_zip/hcat-data/Confocal/Cunningham/traintest/test",
         # the CNN side of fusion: its train config (for the OOF retrain) and
         # the crops .npz (only its `meta`, for matching crop geometry).
-        "cnn_config": "/helpers/ihc_ohc_config.yaml",
-        "crops_train_npz": "/helpers/crops_train.npz",
-        "out_dir": "/helpers/ihc_ohc_geom_run",
+        "cnn_config": "/helpers/ihc_ohc/configs/cnn.yaml",
+        "crops_train_npz": "/helpers/ihc_ohc/runs/cache/crops_train.npz",
+        # Root for run artifacts; each train/sweep/fuse gets a fresh
+        # timestamped subdir (e.g., runs/20260520-104530_train-geom/).
+        "out_dir": "/helpers/ihc_ohc/runs",
+        # Deployed checkpoints — read by ihc_ohc_pipeline.py predict (this
+        # script doesn't use them; declared here so the merge accepts the
+        # fields). Update after each train/fuse run; null → caller must
+        # supply --geom_ckpt / --fuse_ckpt.
+        "geom_ckpt": None,
+        "fuse_ckpt": None,
     },
     "model": {
         "type": "logreg",          # logreg | gbm
@@ -494,11 +513,17 @@ def cross_validate(cfg, *, verbose=True):
     return dict(folds=rows, mean_std=agg)
 
 
-def train(cfg):
+def train(cfg, *, run_dir=None):
+    """One image-level split → pickled model + held-out test report.
+
+    Writes geom_best.pkl (+ test_report.json) into a fresh timestamped
+    subdir under cfg.data.out_dir, plus a frozen config.yaml.
+    """
     d = load_geom_npz(cfg["data"]["geom_train_npz"])
     mcfg = cfg["model"]
-    out_dir = cfg["data"]["out_dir"]
-    os.makedirs(out_dir, exist_ok=True)
+    run_dir = new_run_dir(cfg["data"]["out_dir"], "train-geom", run_dir)
+    save_run_config(run_dir, cfg)
+    print(f"run dir → {run_dir}")
 
     tr, va = group_split(d["groups"], cfg["cv"]["val_frac"], mcfg["seed"])
     model = fit_geom(d["feats"][tr], d["labels"][tr], mcfg)
@@ -512,7 +537,7 @@ def train(cfg):
     final = fit_geom(d["feats"], d["labels"], mcfg)
     ckpt = dict(scaler=final[0], clf=final[1], model_cfg=mcfg,
                 feature_names=d["feature_names"], class_names=CLASS_NAMES)
-    ckpt_path = os.path.join(out_dir, "geom_best.pkl")
+    ckpt_path = os.path.join(run_dir, "geom_best.pkl")
     with open(ckpt_path, "wb") as fh:
         pickle.dump(ckpt, fh)
     print(f"saved model → {ckpt_path}")
@@ -523,8 +548,9 @@ def train(cfg):
         pt = proba_ihc(final, t["feats"])
         cm = cm_from(t["labels"], np.where(pt >= 0.5, IHC, OHC))
         print(f"\nTEST (geom alone)\n{fmt_cm(cm)}")
-        with open(os.path.join(out_dir, "test_report.json"), "w") as fh:
+        with open(os.path.join(run_dir, "test_report.json"), "w") as fh:
             json.dump(metrics_from_cm(cm), fh, indent=2)
+    return run_dir
 
 
 def _dump_importance(model, names):
@@ -545,13 +571,14 @@ def _dump_importance(model, names):
 
 # ── sweep ───────────────────────────────────────────────────────────────────────
 
-def sweep(cfg):
+def sweep(cfg, *, run_dir=None):
     sw = cfg.get("sweep", {})
     grid = ([{}] if not sw else
             [dict(zip(sw, c)) for c in itertools.product(
                 *[v if isinstance(v, list) else [v] for v in sw.values()])])
-    out_dir = cfg["data"]["out_dir"]
-    os.makedirs(out_dir, exist_ok=True)
+    run_dir = new_run_dir(cfg["data"]["out_dir"], "sweep-geom", run_dir)
+    save_run_config(run_dir, cfg)
+    print(f"run dir → {run_dir}")
     print(f"sweep: {len(grid)} configs × {cfg['cv']['folds']}-fold CV")
     res = []
     for i, ov in enumerate(grid, 1):
@@ -569,8 +596,9 @@ def sweep(cfg):
         tag = ", ".join(f"{k}={v}" for k, v in r["override"].items()) or "baseline"
         print(f"  {rk:2d}. bal_acc {r['bal_acc']:.4f} ± {r['bal_acc_std']:.4f}"
               f"  f1 {r['macro_f1']:.4f}  | {tag}")
-    with open(os.path.join(out_dir, "sweep_results.json"), "w") as fh:
+    with open(os.path.join(run_dir, "sweep_results.json"), "w") as fh:
         json.dump(res, fh, indent=2)
+    return run_dir
 
 
 # ── fuse (the headline) ─────────────────────────────────────────────────────────
@@ -579,7 +607,7 @@ def _fuse_mean(p_cnn, p_geom, w):
     return w * p_cnn + (1.0 - w) * p_geom
 
 
-def fuse(cfg):
+def fuse(cfg, *, run_dir=None):
     """CNN ⊕ geom late fusion, honestly estimated.
 
     *Both* train-side signals are out-of-fold on the same `splits`: geom
@@ -588,10 +616,14 @@ def fuse(cfg):
     on those jointly-honest OOF predictions, frozen, then applied to the
     held-out test set — where the *deployed* best.pt is rightly used (test
     was never seen). Reports CNN/geom/fused + a McNemar of fused-vs-CNN.
+
+    Writes fuse.pkl into a fresh timestamped subdir under cfg.data.out_dir,
+    plus a frozen config.yaml.
     """
     mcfg, fcfg = cfg["model"], cfg["fuse"]
-    out_dir = cfg["data"]["out_dir"]
-    os.makedirs(out_dir, exist_ok=True)
+    run_dir = new_run_dir(cfg["data"]["out_dir"], "fuse", run_dir)
+    save_run_config(run_dir, cfg)
+    print(f"run dir → {run_dir}")
     kN = mcfg["k_neighbors"]
     cnn_oof = bool(fcfg.get("cnn_oof", True))
 
@@ -672,7 +704,7 @@ def fuse(cfg):
                 model_cfg=mcfg, k_neighbors=kN, cnn_oof=cnn_oof,
                 cnn_train=m_cnn, fused_train=m_fused, mcnemar=dict(
                     b=b, c=c, chi2=st, p=pval))
-    ckpt_path = os.path.join(out_dir, "fuse.pkl")
+    ckpt_path = os.path.join(run_dir, "fuse.pkl")
     with open(ckpt_path, "wb") as fh:
         pickle.dump(ckpt, fh)
     print(f"saved fusion ckpt → {ckpt_path}")
@@ -703,6 +735,7 @@ def fuse(cfg):
                                   np.where(pf_t >= 0.5, IHC, OHC))
         print(f"\nMcNemar (test) fused-vs-CNN: CNN-only-right={bt}  "
               f"fused-only-right={ct}  χ²={stt:.3f}  p={pt:.4g}")
+    return run_dir
 
 
 # ── predict (write back into one seg) ───────────────────────────────────────────
@@ -790,6 +823,10 @@ def parse_args():
                     ("fuse", "CNN ⊕ geom late fusion + McNemar")):
         s = sub.add_parser(name, help=h)
         s.add_argument("--config", required=True)
+        if name in ("train", "sweep", "fuse"):
+            s.add_argument("--run_dir", default=None,
+                           help="override the auto-stamped run dir "
+                           "(used by ihc_ohc_pipeline.py to group steps)")
     q = sub.add_parser("predict", help="score one seg.npy, write geom/fused back")
     q.add_argument("--geom_ckpt", required=True)
     q.add_argument("--seg", required=True)
@@ -822,8 +859,16 @@ def main():
         return
     cfg = load_config(args.config)
     print_config(cfg, tag=f"{args.cmd} config ({args.config})")
-    {"rule": rule_cmd, "cv": cross_validate, "train": train,
-     "sweep": sweep, "fuse": fuse}[args.cmd](cfg)
+    if args.cmd == "train":
+        train(cfg, run_dir=args.run_dir)
+    elif args.cmd == "sweep":
+        sweep(cfg, run_dir=args.run_dir)
+    elif args.cmd == "fuse":
+        fuse(cfg, run_dir=args.run_dir)
+    elif args.cmd == "cv":
+        cross_validate(cfg)
+    else:  # rule
+        rule_cmd(cfg)
 
 
 if __name__ == "__main__":

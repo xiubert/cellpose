@@ -23,10 +23,24 @@ Subcommands
            (fused | geom | cnn | gt); flagged cells ringed. → PNG.
 
 Run inside the cellpose container (paths are container paths):
-  podman exec cellpose python3 /helpers/ihc_ohc_pipeline.py <cmd> ...
+  podman exec cellpose python3 /helpers/ihc_ohc/ihc_ohc_pipeline.py <cmd> ...
+
+Run-artifact layout
+-------------------
+The full `train` pipeline writes three sibling timestamped dirs under
+data.out_dir (default /helpers/ihc_ohc/runs/), all sharing one stamp so a
+pipeline invocation groups visually:
+
+  runs/20260520-104530_train-cnn/   best.pt, history.json, config.yaml, …
+  runs/20260520-104530_train-geom/  geom_best.pkl, test_report.json, …
+  runs/20260520-104530_fuse/        fuse.pkl, config.yaml
+
+The pipeline echoes those paths at the end so subsequent `predict` calls
+can use them (via --cnn_ckpt / --geom_ckpt / --fuse_ckpt).
 """
 
 import argparse
+import datetime
 import os
 import subprocess
 import sys
@@ -34,9 +48,9 @@ import sys
 import numpy as np
 import yaml
 
-HELP = "/helpers"
-CNN_CFG = f"{HELP}/ihc_ohc_config.yaml"
-GEOM_CFG = f"{HELP}/ihc_ohc_geom_config.yaml"
+HOST = "/helpers/ihc_ohc"          # container path of helpers/ihc_ohc/
+CNN_CFG = f"{HOST}/configs/cnn.yaml"
+GEOM_CFG = f"{HOST}/configs/geom.yaml"
 
 
 # ── config helpers (read-only; defaults mirror each module's DEFAULT_CONFIG) ─────
@@ -123,47 +137,74 @@ def cmd_train(args):
     cnn = _yaml(args.cnn_config)
     geom = _yaml(args.geom_config)
     train_dir, test_dir = args.train_dir, args.test_dir
-    crops_tr = _get(cnn, "data", "train_npz", f"{HELP}/crops_train.npz")
-    crops_te = _get(cnn, "data", "test_npz", f"{HELP}/crops_test.npz")
-    cnn_ckpt = os.path.join(
-        _get(cnn, "data", "out_dir", f"{HELP}/ihc_ohc_run"), "best.pt")
-    geom_tr = _get(geom, "data", "geom_train_npz", f"{HELP}/geom_train.npz")
-    geom_te = _get(geom, "data", "geom_test_npz", f"{HELP}/geom_test.npz")
+    cache_default = f"{HOST}/runs/cache"
+    crops_tr = _get(cnn, "data", "train_npz", f"{cache_default}/crops_train.npz")
+    crops_te = _get(cnn, "data", "test_npz", f"{cache_default}/crops_test.npz")
+    geom_tr = _get(geom, "data", "geom_train_npz", f"{cache_default}/geom_train.npz")
+    geom_te = _get(geom, "data", "geom_test_npz", f"{cache_default}/geom_test.npz")
+
+    # One shared timestamp for every step → all run dirs sit next to each
+    # other under runs/ so a pipeline invocation is visually grouped.
+    stamp = args.stamp or datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    cnn_out = _get(cnn, "data", "out_dir", f"{HOST}/runs")
+    geom_out = _get(geom, "data", "out_dir", f"{HOST}/runs")
+    cnn_run = f"{cnn_out}/{stamp}_train-cnn"
+    geom_run = f"{geom_out}/{stamp}_train-geom"
+    fuse_run = f"{geom_out}/{stamp}_fuse"
+    cnn_ckpt = f"{cnn_run}/best.pt"
+    os.makedirs(os.path.dirname(crops_tr), exist_ok=True)
+    print(f"\n=== pipeline timestamp: {stamp} ===")
 
     py = sys.executable
     # 1. CNN crops → train CNN
-    _run([py, f"{HELP}/ihc_ohc_crops.py", "--data_dir", train_dir,
-          "--out", crops_tr, "--preview", f"{HELP}/crops_train_preview.png"])
-    _run([py, f"{HELP}/ihc_ohc_crops.py", "--data_dir", test_dir,
+    _run([py, f"{HOST}/ihc_ohc_crops.py", "--data_dir", train_dir,
+          "--out", crops_tr,
+          "--preview", f"{cache_default}/crops_train_preview.png"])
+    _run([py, f"{HOST}/ihc_ohc_crops.py", "--data_dir", test_dir,
           "--out", crops_te])
-    _run([py, f"{HELP}/ihc_ohc_classifier.py", "train",
-          "--config", args.cnn_config])
+    _run([py, f"{HOST}/ihc_ohc_classifier.py", "train",
+          "--config", args.cnn_config, "--run_dir", cnn_run])
     # 2. geom table → train geom
-    _run([py, f"{HELP}/ihc_ohc_geom.py", "--data_dir", train_dir,
-          "--out", geom_tr, "--preview", f"{HELP}/geom_train_preview.png"])
-    _run([py, f"{HELP}/ihc_ohc_geom.py", "--data_dir", test_dir,
+    _run([py, f"{HOST}/ihc_ohc_geom.py", "--data_dir", train_dir,
+          "--out", geom_tr,
+          "--preview", f"{cache_default}/geom_train_preview.png"])
+    _run([py, f"{HOST}/ihc_ohc_geom.py", "--data_dir", test_dir,
           "--out", geom_te])
-    _run([py, f"{HELP}/ihc_ohc_geom_clf.py", "train",
-          "--config", args.geom_config])
+    _run([py, f"{HOST}/ihc_ohc_geom_clf.py", "train",
+          "--config", args.geom_config, "--run_dir", geom_run])
     # 3. CNN probs into every seg (fusion prerequisite) → fuse
     print("\n=== writing CNN class_prob into all segs (fusion prereq) ===")
     cnn_predict_dir(cnn_ckpt, train_dir)
     cnn_predict_dir(cnn_ckpt, test_dir)
-    _run([py, f"{HELP}/ihc_ohc_geom_clf.py", "fuse",
-          "--config", args.geom_config])
-    print("\n✓ pipeline complete — best.pt, geom_best.pkl, fuse.pkl ready")
+    _run([py, f"{HOST}/ihc_ohc_geom_clf.py", "fuse",
+          "--config", args.geom_config, "--run_dir", fuse_run])
+    print("\n✓ pipeline complete:")
+    print(f"   CNN  ckpt → {cnn_ckpt}")
+    print(f"   geom ckpt → {geom_run}/geom_best.pkl")
+    print(f"   fuse ckpt → {fuse_run}/fuse.pkl")
 
 
 # ── predict: score a seg / dir with the whole stack ─────────────────────────────
 
 def cmd_predict(args):
+    """Score a seg / dir with the full stack.
+
+    With timestamped run dirs there is no canonical "latest" path, so the
+    three checkpoint paths must be passed explicitly (CLI or
+    data.cnn_ckpt / data.geom_ckpt / data.fuse_ckpt in the YAML configs).
+    """
     cnn = _yaml(args.cnn_config)
     geom = _yaml(args.geom_config)
-    cnn_ckpt = args.cnn_ckpt or os.path.join(
-        _get(cnn, "data", "out_dir", f"{HELP}/ihc_ohc_run"), "best.pt")
-    out_dir = _get(geom, "data", "out_dir", f"{HELP}/ihc_ohc_geom_run")
-    geom_ckpt = args.geom_ckpt or f"{out_dir}/geom_best.pkl"
-    fuse_ckpt = args.fuse_ckpt or f"{out_dir}/fuse.pkl"
+    cnn_ckpt = args.cnn_ckpt or _get(cnn, "data", "cnn_ckpt", None)
+    geom_ckpt = args.geom_ckpt or _get(geom, "data", "geom_ckpt", None)
+    fuse_ckpt = args.fuse_ckpt or _get(geom, "data", "fuse_ckpt", None)
+    missing = [n for n, v in (("--cnn_ckpt", cnn_ckpt),
+                              ("--geom_ckpt", geom_ckpt),
+                              ("--fuse_ckpt", fuse_ckpt)) if not v]
+    if missing:
+        sys.exit(f"predict: missing checkpoint path(s) {missing}. Pass via "
+                 "CLI flag or set data.cnn_ckpt / geom_ckpt / fuse_ckpt in "
+                 "the YAML configs (each train/fuse run prints its run dir).")
     py = sys.executable
 
     if args.dir:
@@ -171,14 +212,14 @@ def cmd_predict(args):
         print(f"=== CNN write-back over {args.dir} ===")
         cnn_predict_dir(cnn_ckpt, args.dir)
         for sp, _ in iter_seg_files(args.dir):
-            _run([py, f"{HELP}/ihc_ohc_geom_clf.py", "predict",
+            _run([py, f"{HOST}/ihc_ohc_geom_clf.py", "predict",
                   "--geom_ckpt", geom_ckpt, "--fuse_ckpt", fuse_ckpt,
                   "--fuse", "--seg", sp, "--write"])
     else:
         # single seg: the two per-seg CLIs as-is (single source of truth)
-        _run([py, f"{HELP}/ihc_ohc_classifier.py", "predict",
+        _run([py, f"{HOST}/ihc_ohc_classifier.py", "predict",
               "--ckpt", cnn_ckpt, "--seg", args.seg, "--write"])
-        _run([py, f"{HELP}/ihc_ohc_geom_clf.py", "predict",
+        _run([py, f"{HOST}/ihc_ohc_geom_clf.py", "predict",
               "--geom_ckpt", geom_ckpt, "--fuse_ckpt", fuse_ckpt,
               "--fuse", "--seg", args.seg, "--write"])
 
@@ -348,6 +389,9 @@ def parse_args():
     t.add_argument("--test_dir", required=True, help="seg+tif dir (test)")
     t.add_argument("--cnn_config", default=CNN_CFG)
     t.add_argument("--geom_config", default=GEOM_CFG)
+    t.add_argument("--stamp", default=None,
+                   help="timestamp prefix shared by every run dir in this "
+                   "pipeline invocation (default: %%Y%%m%%d-%%H%%M%%S now)")
 
     q = sub.add_parser("predict", help="score a seg / dir with the full stack")
     g = q.add_mutually_exclusive_group(required=True)

@@ -1,21 +1,30 @@
-# IHC/OHC classifier config — single source of truth for every run.
+# IHC/OHC CNN classifier config — single source of truth for every CNN run.
 #
-# Used by all three drivers (each: --config /helpers/ihc_ohc_config.yaml):
+# Used by all three drivers (each: --config /helpers/ihc_ohc/configs/cnn.yaml):
 #   sweep  CV-scores every point in the `sweep:` grid → ranked leaderboard
 #   cv     GroupKFold cross-validation with the `train:` values as-is
 #   train  one image-level split → checkpoint + held-out test report
 #
 # A partial file is fine: anything omitted falls back to DEFAULT_CONFIG in
 # ihc_ohc_classifier.py. Unknown keys are rejected (typo guard). The fully
-# resolved config is echoed at the top of every run.
+# resolved config is echoed at the top of every run AND frozen as
+# config.yaml inside the run dir.
 #
 # Paths are container paths (/data = /media/DATA/Chris/cellpose2D,
 # /helpers = the host helpers dir).
 
 data:
-  train_npz: /helpers/crops_train.npz
-  test_npz:  /helpers/crops_test.npz     # null → skip the test report in `train`
-  out_dir:   /helpers/ihc_ohc_run        # best.pt, history.json, *_results.json
+  train_npz: /helpers/ihc_ohc/runs/cache/crops_train.npz
+  test_npz:  /helpers/ihc_ohc/runs/cache/crops_test.npz   # null → skip test report in `train`
+  # Root for run artifacts. Each train/sweep invocation gets a fresh
+  # timestamped subdir under here (e.g. 20260520-104530_train-cnn/) with
+  # best.pt, history.json, test_misclassified.png + frozen config.yaml.
+  out_dir:   /helpers/ihc_ohc/runs
+
+  # Deployed CNN checkpoint, consumed by ihc_ohc_pipeline.py predict.
+  # Update after a `train` run to point at the new best.pt; null = require
+  # the caller to pass --cnn_ckpt on the predict CLI.
+  cnn_ckpt: null
 
 train:
   epochs:        40        # cosine horizon — match to a realistic run length

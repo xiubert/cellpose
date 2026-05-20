@@ -4,7 +4,7 @@ Phase 2 — tiny CNN for IHC vs OHC classification of Cellpose instances.
 Input  : (2, S, S)  — MYO7A crop + target-instance mask, from ihc_ohc_crops.py
 Output : 2-class logits (0=IHC, 1=OHC)
 
-All hyperparameters live in a YAML config (see ihc_ohc_config.yaml), not in
+All hyperparameters live in a YAML config (see configs/cnn.yaml), not in
 CLI flags, so runs are reproducible and sweeps are declarative.
 
 Subcommands (each takes --config <yaml>)
@@ -23,20 +23,29 @@ Subcommands (each takes --config <yaml>)
            instance with the *same* expansion code, classify, and write
            `class_map_pred` / `class_prob` back into the seg dict.
 
+Every `train` / `sweep` writes to a fresh timestamped subdir under
+`data.out_dir` — e.g. runs/20260520-104530_train-cnn/. The resolved config
+is frozen alongside as `config.yaml` so any run is reproducible from its
+own folder. `--run_dir <path>` overrides the auto-stamp (the pipeline
+orchestrator uses this to keep all steps of one pipeline run under one
+timestamp).
+
 Dependencies (beyond the cellpose env): PyYAML (config) and scikit-learn
 (sklearn.model_selection.GroupKFold) — both must be installed in the
 container; see ihc_ohc.md.
 
 Usage (inside the cellpose container; /helpers is the host helpers dir)
 -----------------------------------------------------------------------
-  python /helpers/ihc_ohc_crops.py --data_dir .../traintest/train --out /helpers/crops_train.npz
-  python /helpers/ihc_ohc_crops.py --data_dir .../traintest/test  --out /helpers/crops_test.npz
+  python /helpers/ihc_ohc/ihc_ohc_crops.py --data_dir .../traintest/train \
+      --out /helpers/ihc_ohc/runs/cache/crops_train.npz
+  python /helpers/ihc_ohc/ihc_ohc_crops.py --data_dir .../traintest/test  \
+      --out /helpers/ihc_ohc/runs/cache/crops_test.npz
 
-  python /helpers/ihc_ohc_classifier.py sweep --config /helpers/ihc_ohc_config.yaml
-  python /helpers/ihc_ohc_classifier.py cv    --config /helpers/ihc_ohc_config.yaml
-  python /helpers/ihc_ohc_classifier.py train --config /helpers/ihc_ohc_config.yaml
-  python /helpers/ihc_ohc_classifier.py predict \
-      --ckpt /helpers/ihc_ohc_run/best.pt \
+  python /helpers/ihc_ohc/ihc_ohc_classifier.py sweep --config /helpers/ihc_ohc/configs/cnn.yaml
+  python /helpers/ihc_ohc/ihc_ohc_classifier.py cv    --config /helpers/ihc_ohc/configs/cnn.yaml
+  python /helpers/ihc_ohc/ihc_ohc_classifier.py train --config /helpers/ihc_ohc/configs/cnn.yaml
+  python /helpers/ihc_ohc/ihc_ohc_classifier.py predict \
+      --ckpt /helpers/ihc_ohc/runs/<stamp>_train-cnn/best.pt \
       --seg  /data/.../000_cunningham_mouse_confocal_myo7a_seg.npy --write
 """
 
@@ -57,8 +66,8 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision.transforms import functional as TF
 
 from ihc_ohc_crops import (
-    CLASS_NAMES, extract_cell_crop, load_image_plane, resolve_class_map,
-    seg_stem, tif_for_seg, update_pred,
+    CLASS_NAMES, extract_cell_crop, load_image_plane, new_run_dir,
+    resolve_class_map, save_run_config, tif_for_seg, update_pred,
 )
 
 
@@ -69,9 +78,16 @@ from ihc_ohc_crops import (
 # `train` values are the tuned defaults derived from the smoke-test analysis.
 DEFAULT_CONFIG = {
     "data": {
-        "train_npz": "/helpers/crops_train.npz",
-        "test_npz": "/helpers/crops_test.npz",
-        "out_dir": "/helpers/ihc_ohc_run",
+        "train_npz": "/helpers/ihc_ohc/runs/cache/crops_train.npz",
+        "test_npz": "/helpers/ihc_ohc/runs/cache/crops_test.npz",
+        # Root for run artifacts; each train/sweep gets a fresh timestamped
+        # subdir under here (e.g., runs/20260520-104530_train-cnn/).
+        "out_dir": "/helpers/ihc_ohc/runs",
+        # Deployed CNN checkpoint — read by ihc_ohc_pipeline.py predict
+        # (this script doesn't use it; declared here so the merge accepts
+        # the field). Update after each train run; null → caller must
+        # supply --cnn_ckpt.
+        "cnn_ckpt": None,
     },
     "train": {
         "epochs": 40,
@@ -462,12 +478,19 @@ def fit(crops, labels, tr_idx, va_idx, tcfg, device, *, verbose=True):
                 best_metrics=history[best_ep - 1])
 
 
-def train(cfg):
-    """One image-level split → fit → checkpoint + held-out test report."""
+def train(cfg, *, run_dir=None):
+    """One image-level split → fit → checkpoint + held-out test report.
+
+    Writes best.pt + history.json (+ test_misclassified.png) into a fresh
+    timestamped subdir under cfg.data.out_dir, plus a frozen config.yaml.
+    `run_dir` overrides the auto-stamp (the pipeline passes it to keep all
+    steps of one full-pipeline run under the same timestamp).
+    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tcfg = cfg["train"]
-    out_dir = cfg["data"]["out_dir"]
-    os.makedirs(out_dir, exist_ok=True)
+    run_dir = new_run_dir(cfg["data"]["out_dir"], "train-cnn", run_dir)
+    save_run_config(run_dir, cfg)
+    print(f"run dir → {run_dir}")
 
     crops, labels, groups, names, meta = load_npz(cfg["data"]["train_npz"])
     tr, va = group_split(groups, cfg["cv"]["val_frac"], tcfg["seed"])
@@ -486,9 +509,9 @@ def train(cfg):
                 crop_meta=meta if isinstance(meta, dict) else dict(meta),
                 train_cfg=dict(tcfg, best_epoch=r["best_ep"],
                                best_sel_score=r["best_score"]))
-    ckpt_path = os.path.join(out_dir, "best.pt")
+    ckpt_path = os.path.join(run_dir, "best.pt")
     torch.save(ckpt, ckpt_path)
-    with open(os.path.join(out_dir, "history.json"), "w") as fh:
+    with open(os.path.join(run_dir, "history.json"), "w") as fh:
         json.dump(r["history"], fh, indent=2)
     print(f"\nsaved checkpoint → {ckpt_path}")
 
@@ -500,8 +523,9 @@ def train(cfg):
                            batch_size=tcfg["batch_size"])
         loss, cm, ys, preds = evaluate(model, dl_te, device)
         print(f"\nTEST  loss {loss:.4f}\n{fmt_cm(cm)}")
-        _save_misclassified(os.path.join(out_dir, "test_misclassified.png"),
+        _save_misclassified(os.path.join(run_dir, "test_misclassified.png"),
                             tc, ys, preds)
+    return run_dir
 
 
 # ── cross-validation & sweep ────────────────────────────────────────────────────
@@ -560,11 +584,15 @@ def _sweep_grid(sweep):
     return [dict(zip(keys, combo)) for combo in itertools.product(*axes)]
 
 
-def sweep(cfg):
-    """CV-score every point in the sweep grid; print a ranked leaderboard."""
+def sweep(cfg, *, run_dir=None):
+    """CV-score every point in the sweep grid; print a ranked leaderboard.
+
+    Writes sweep_results.json + frozen config.yaml into a fresh timestamped
+    run subdir under cfg.data.out_dir."""
     grid = _sweep_grid(cfg.get("sweep", {}))
-    out_dir = cfg["data"]["out_dir"]
-    os.makedirs(out_dir, exist_ok=True)
+    run_dir = new_run_dir(cfg["data"]["out_dir"], "sweep-cnn", run_dir)
+    save_run_config(run_dir, cfg)
+    print(f"run dir → {run_dir}")
     print(f"sweep: {len(grid)} configurations × {cfg['cv']['folds']}-fold CV")
 
     results = []
@@ -591,9 +619,10 @@ def sweep(cfg):
     best = results[0]
     print(f"\nbest: {best['override'] or 'baseline'}  "
           f"→ set these in train: and run `train --config`")
-    with open(os.path.join(out_dir, "sweep_results.json"), "w") as fh:
+    with open(os.path.join(run_dir, "sweep_results.json"), "w") as fh:
         json.dump(results, fh, indent=2)
-    print(f"saved → {os.path.join(out_dir, 'sweep_results.json')}")
+    print(f"saved → {os.path.join(run_dir, 'sweep_results.json')}")
+    return run_dir
 
 
 def _save_misclassified(path, crops, ys, preds, limit=40):
@@ -728,7 +757,11 @@ def parse_args():
     ):
         s = sub.add_parser(name, help=helptext)
         s.add_argument("--config", required=True,
-                       help="YAML config (see ihc_ohc_config.yaml)")
+                       help="YAML config (see configs/cnn.yaml)")
+        if name in ("train", "sweep"):
+            s.add_argument("--run_dir", default=None,
+                           help="override the auto-stamped run dir "
+                           "(used by ihc_ohc_pipeline.py to group steps)")
 
     q = sub.add_parser("predict", help="classify instances in a _seg.npy")
     q.add_argument("--ckpt", required=True)
@@ -745,7 +778,12 @@ def main():
         return
     cfg = load_config(args.config)
     print_config(cfg, tag=f"{args.cmd} config ({args.config})")
-    {"train": train, "cv": cross_validate, "sweep": sweep}[args.cmd](cfg)
+    if args.cmd == "train":
+        train(cfg, run_dir=args.run_dir)
+    elif args.cmd == "sweep":
+        sweep(cfg, run_dir=args.run_dir)
+    else:  # cv
+        cross_validate(cfg)
 
 
 if __name__ == "__main__":

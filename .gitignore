@@ -135,11 +135,9 @@ helpers/models
 old/
 notes/
 backup/
-crops*
-ihc_ohc_run*
-ihc_ohc_geom_run*
-ihc_ohc_sweep*
-*.npz
-*_preview.png
-*.pkl
-*_report.json
+
+# IHC/OHC pipeline artifacts — preprocessing caches + every train/sweep/fuse
+# run is timestamped under helpers/ihc_ohc/runs/ (best.pt, geom_best.pkl,
+# fuse.pkl, history.json, *_results.json, *_preview.png, …). Code, configs,
+# and docs in helpers/ihc_ohc/ stay tracked.
+helpers/ihc_ohc/runs/

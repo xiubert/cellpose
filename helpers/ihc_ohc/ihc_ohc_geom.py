@@ -51,12 +51,13 @@ scipy (already present). No torch — the geometric stack stays light.
 
 Usage (inside the cellpose container; /data = /media/DATA/Chris/cellpose2D)
 --------------------------------------------------------------------------
-  python /helpers/ihc_ohc_geom.py \
+  python /helpers/ihc_ohc/ihc_ohc_geom.py \
       --data_dir /data/to_zip/hcat-data/Confocal/Cunningham/traintest/train \
-      --out /helpers/geom_train.npz --preview /helpers/geom_train_preview.png
-  python /helpers/ihc_ohc_geom.py \
+      --out /helpers/ihc_ohc/runs/cache/geom_train.npz \
+      --preview /helpers/ihc_ohc/runs/cache/geom_train_preview.png
+  python /helpers/ihc_ohc/ihc_ohc_geom.py \
       --data_dir /data/to_zip/hcat-data/Confocal/Cunningham/traintest/test \
-      --out /helpers/geom_test.npz
+      --out /helpers/ihc_ohc/runs/cache/geom_test.npz
 """
 
 import argparse

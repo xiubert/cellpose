@@ -8,7 +8,13 @@ instance's own mask. Two scripts + one config:
 |---|---|---|
 | `ihc_ohc_crops.py` | 1 — data prep / inference cropping | Expand each instance bbox, pad, add the target-mask channel, resize → fixed crops |
 | `ihc_ohc_classifier.py` | 2 — model | `TinyHCNet` `sweep` / `cv` / `train` / `predict`; reuses Phase-1 cropping at inference |
-| `ihc_ohc_config.yaml` | — | all classifier hyperparameters (sweep / CV / train) |
+| `configs/cnn.yaml` | — | all classifier hyperparameters (sweep / CV / train) |
+
+All of the above live in [`helpers/ihc_ohc/`](.) and run inside the
+cellpose container as `python3 /helpers/ihc_ohc/<script>.py …`. Run
+artifacts (best.pt, history.json, sweep_results.json, the crops/geom
+`.npz` caches, …) go to `runs/` next to the code — see
+*[Run-artifact layout](#run-artifact-layout)* below.
 
 ## Pipeline
 
@@ -121,47 +127,85 @@ Raising it bus-errors unless the container is restarted with a larger
 
 All classifier hyperparameters live in a YAML config, **not** CLI flags —
 runs are reproducible and sweeps are declarative. See
-[`ihc_ohc_config.yaml`](ihc_ohc_config.yaml) for the annotated schema
+[`configs/cnn.yaml`](configs/cnn.yaml) for the annotated schema
 (`data:` / `train:` / `cv:` / `sweep:`). A partial file is valid (missing
 keys fall back to `DEFAULT_CONFIG`); unknown keys are rejected; the resolved
-config is echoed at the start of every run. Crop building
-(`ihc_ohc_crops.py`) stays CLI-flag driven (it is run once).
+config is echoed at the start of every run AND frozen as `config.yaml`
+inside the run's artifact dir (see *Run-artifact layout* below). Crop
+building (`ihc_ohc_crops.py`) stays CLI-flag driven (it is run once).
+
+## Run-artifact layout
+
+Every `train` / `sweep` / `fuse` invocation writes to a fresh
+**timestamped subdir** under `data.out_dir` (default
+`/helpers/ihc_ohc/runs/`) — previous runs are preserved automatically:
+
+```
+helpers/ihc_ohc/
+  ihc_ohc_*.py
+  configs/{cnn,geom}.yaml
+  ihc_ohc.md
+  runs/                         (gitignored)
+    cache/                      preprocessing caches (named, not stamped)
+      crops_train.npz, crops_test.npz, geom_train.npz, geom_test.npz
+    20260520-104530_train-cnn/  best.pt, history.json,
+                                test_misclassified.png, config.yaml
+    20260520-104530_train-geom/ geom_best.pkl, test_report.json, config.yaml
+    20260520-104530_fuse/       fuse.pkl, config.yaml
+    20260519-113047_sweep-cnn/  sweep_results.json, config.yaml
+    …
+```
+
+`config.yaml` is the fully-resolved config at run time, so any past run is
+reproducible from its own folder. `ihc_ohc_pipeline.py train` reuses one
+timestamp across the three steps it runs so they group visually; the
+underlying CLIs auto-stamp when called directly and accept `--run_dir
+<path>` for explicit placement.
+
+To use a previous run for inference, point the config's
+`data.cnn_ckpt` / `data.geom_ckpt` / `data.fuse_ckpt` at the desired files
+(or pass `--cnn_ckpt` / `--geom_ckpt` / `--fuse_ckpt` to
+`ihc_ohc_pipeline.py predict`).
 
 ## Usage
 
 Run inside the cellpose container (`podman exec cellpose …`). Mounts:
-`/data` = `/media/DATA/Chris/cellpose2D`, `/helpers` = this folder.
+`/data` = `/media/DATA/Chris/cellpose2D`, `/helpers` = the host
+`cellpose_git/helpers/` dir; this folder is `/helpers/ihc_ohc/`.
 
 ```bash
 # 1. build crops (image-level split is implicit: train/ vs test/ dirs)
-python3 /helpers/ihc_ohc_crops.py \
+python3 /helpers/ihc_ohc/ihc_ohc_crops.py \
     --data_dir /data/to_zip/hcat-data/Confocal/Cunningham/traintest/train \
-    --out /helpers/crops_train.npz --preview /helpers/crops_train_preview.png
-python3 /helpers/ihc_ohc_crops.py \
+    --out /helpers/ihc_ohc/runs/cache/crops_train.npz \
+    --preview /helpers/ihc_ohc/runs/cache/crops_train_preview.png
+python3 /helpers/ihc_ohc/ihc_ohc_crops.py \
     --data_dir /data/to_zip/hcat-data/Confocal/Cunningham/traintest/test \
-    --out /helpers/crops_test.npz
+    --out /helpers/ihc_ohc/runs/cache/crops_test.npz
 
-# 2. eyeball crops_train_preview.png BEFORE training
+# 2. eyeball runs/cache/crops_train_preview.png BEFORE training
 
 # 3a. (optional) hyperparameter sweep — edit `sweep:` in the config first
-python3 /helpers/ihc_ohc_classifier.py sweep --config /helpers/ihc_ohc_config.yaml
+python3 /helpers/ihc_ohc/ihc_ohc_classifier.py sweep --config /helpers/ihc_ohc/configs/cnn.yaml
 
 # 3b. (optional) cross-validate the chosen config (generalisation estimate)
-python3 /helpers/ihc_ohc_classifier.py cv    --config /helpers/ihc_ohc_config.yaml
+python3 /helpers/ihc_ohc/ihc_ohc_classifier.py cv    --config /helpers/ihc_ohc/configs/cnn.yaml
 
 # 4. train the final model (one split → checkpoint + held-out test report)
-python3 /helpers/ihc_ohc_classifier.py train --config /helpers/ihc_ohc_config.yaml
+python3 /helpers/ihc_ohc/ihc_ohc_classifier.py train --config /helpers/ihc_ohc/configs/cnn.yaml
 
 # 5. predict on a segmentation (optionally write predictions back in)
-python3 /helpers/ihc_ohc_classifier.py predict \
-    --ckpt /helpers/ihc_ohc_run/best.pt \
+python3 /helpers/ihc_ohc/ihc_ohc_classifier.py predict \
+    --ckpt /helpers/ihc_ohc/runs/<stamp>_train-cnn/best.pt \
     --seg  /data/.../000_cunningham_mouse_confocal_myo7a_seg.npy --write
 ```
 
 Typical flow: **sweep → pick the top row → copy its values into `train:` →
-cv → train**. Outputs in `data.out_dir`: `best.pt` (weights + norm stats +
-crop params + resolved `train_cfg`), `history.json`, `sweep_results.json`,
-a test confusion matrix (stdout), and `test_misclassified.png`.
+cv → train**. Outputs in the new `runs/<stamp>_train-cnn/`: `best.pt`
+(weights + norm stats + crop params + resolved `train_cfg`),
+`history.json`, a test confusion matrix (stdout), `test_misclassified.png`,
+and a frozen `config.yaml`. `sweep` writes `sweep_results.json` +
+`config.yaml` into `runs/<stamp>_sweep-cnn/`.
 
 ## Knobs
 
@@ -175,7 +219,7 @@ Crop builder (`ihc_ohc_crops.py`, CLI flags):
 | `--hard_mask` | off | binarise mask channel |
 | `--include-augmented` | off | also use on-disk D4 copies |
 
-Classifier (`ihc_ohc_config.yaml`):
+Classifier (`configs/cnn.yaml`):
 
 | Key | Default | Note |
 |---|---|---|
@@ -214,8 +258,8 @@ were stored in-line) still work — no forced migration. To clean up
 legacy in-seg keys on demand:
 
 ```bash
-python3 /helpers/ihc_ohc_pipeline.py migrate-preds --dir <data_dir> --dry-run
-python3 /helpers/ihc_ohc_pipeline.py migrate-preds --dir <data_dir>
+python3 /helpers/ihc_ohc/ihc_ohc_pipeline.py migrate-preds --dir <data_dir> --dry-run
+python3 /helpers/ihc_ohc/ihc_ohc_pipeline.py migrate-preds --dir <data_dir>
 ```
 
 The migrator only strips keys from the seg *after* the sidecar write
@@ -237,7 +281,7 @@ available — and it needs **no change to the tuned CNN** (it already writes
 |---|---|---|
 | `ihc_ohc_geom.py` | 1 — features | `geom_features_for_seg` (one source of truth, builder + inference) → 21-D per-cell vector; CLI builder → `geom_*.npz`; QC overlay |
 | `ihc_ohc_geom_clf.py` | 2 — model + fusion | `rule` / `cv` / `train` / `sweep` / `fuse` / `predict` |
-| `ihc_ohc_geom_config.yaml` | — | all geom + fusion hyperparameters |
+| `configs/geom.yaml` | — | all geom + fusion hyperparameters |
 
 ## The signal
 
@@ -334,26 +378,29 @@ path never imports torch.
 
 ```bash
 # 1. build geom tables (image-level split implicit: train/ vs test/)
-python3 /helpers/ihc_ohc_geom.py \
+python3 /helpers/ihc_ohc/ihc_ohc_geom.py \
     --data_dir /data/.../traintest/train \
-    --out /helpers/geom_train.npz --preview /helpers/geom_train_preview.png
-python3 /helpers/ihc_ohc_geom.py \
-    --data_dir /data/.../traintest/test --out /helpers/geom_test.npz
+    --out /helpers/ihc_ohc/runs/cache/geom_train.npz \
+    --preview /helpers/ihc_ohc/runs/cache/geom_train_preview.png
+python3 /helpers/ihc_ohc/ihc_ohc_geom.py \
+    --data_dir /data/.../traintest/test \
+    --out /helpers/ihc_ohc/runs/cache/geom_test.npz
 
 # 2. training-free baseline / cross-validate / train the learned model
-python3 /helpers/ihc_ohc_geom_clf.py rule  --config /helpers/ihc_ohc_geom_config.yaml
-python3 /helpers/ihc_ohc_geom_clf.py cv    --config /helpers/ihc_ohc_geom_config.yaml
-python3 /helpers/ihc_ohc_geom_clf.py train --config /helpers/ihc_ohc_geom_config.yaml
+python3 /helpers/ihc_ohc/ihc_ohc_geom_clf.py rule  --config /helpers/ihc_ohc/configs/geom.yaml
+python3 /helpers/ihc_ohc/ihc_ohc_geom_clf.py cv    --config /helpers/ihc_ohc/configs/geom.yaml
+python3 /helpers/ihc_ohc/ihc_ohc_geom_clf.py train --config /helpers/ihc_ohc/configs/geom.yaml
 
 # 3. write the CNN's class_prob into the segs (prereq for fusion), then fuse
-python3 /helpers/ihc_ohc_classifier.py predict \
-    --ckpt /helpers/ihc_ohc_run/best.pt --seg <each _seg.npy> --write
-python3 /helpers/ihc_ohc_geom_clf.py fuse  --config /helpers/ihc_ohc_geom_config.yaml
+python3 /helpers/ihc_ohc/ihc_ohc_classifier.py predict \
+    --ckpt /helpers/ihc_ohc/runs/<stamp>_train-cnn/best.pt \
+    --seg <each _seg.npy> --write
+python3 /helpers/ihc_ohc/ihc_ohc_geom_clf.py fuse  --config /helpers/ihc_ohc/configs/geom.yaml
 
 # 4. score one seg, write geom + fused decisions back (non-destructive)
-python3 /helpers/ihc_ohc_geom_clf.py predict \
-    --geom_ckpt /helpers/ihc_ohc_geom_run/geom_best.pkl \
-    --fuse_ckpt /helpers/ihc_ohc_geom_run/fuse.pkl --fuse \
+python3 /helpers/ihc_ohc/ihc_ohc_geom_clf.py predict \
+    --geom_ckpt /helpers/ihc_ohc/runs/<stamp>_train-geom/geom_best.pkl \
+    --fuse_ckpt /helpers/ihc_ohc/runs/<stamp>_fuse/fuse.pkl --fuse \
     --seg /data/.../000_..._seg.npy --write
 ```
 
@@ -372,7 +419,7 @@ Geom builder (`ihc_ohc_geom.py`, CLI):
 | `--include-augmented` | off | also use augment.py's D4 copies |
 | `--preview` | — | per-image QC overlay PNG |
 
-Geom classifier / fusion (`ihc_ohc_geom_config.yaml`):
+Geom classifier / fusion (`configs/geom.yaml`):
 
 | Key | Default | Note |
 |---|---|---|
@@ -393,16 +440,20 @@ write-back and the plot).
 ```bash
 DATA=/data/to_zip/hcat-data/Confocal/Cunningham/traintest
 
-# A. train everything (crops→CNN→geom table→geom→CNN write-back→fuse)
-python3 /helpers/ihc_ohc_pipeline.py train \
+# A. train everything (crops→CNN→geom table→geom→CNN write-back→fuse).
+#    All three steps share one timestamp so the run dirs sit together
+#    under runs/.
+python3 /helpers/ihc_ohc/ihc_ohc_pipeline.py train \
     --train_dir $DATA/train --test_dir $DATA/test
 
-# B. score one image (or a whole dir) with the full stack, write back
-python3 /helpers/ihc_ohc_pipeline.py predict --seg $DATA/test/009_..._seg.npy
-python3 /helpers/ihc_ohc_pipeline.py predict --dir $DATA/test
+# B. score one image (or a whole dir) with the full stack, write back.
+#    Pass --cnn_ckpt / --geom_ckpt / --fuse_ckpt or set them in the
+#    YAML configs (data.cnn_ckpt etc) to point at the deployed run.
+python3 /helpers/ihc_ohc/ihc_ohc_pipeline.py predict --seg $DATA/test/009_..._seg.npy
+python3 /helpers/ihc_ohc/ihc_ohc_pipeline.py predict --dir $DATA/test
 
 # C. plot masks tinted by class (source: fused | geom | cnn | gt)
-python3 /helpers/ihc_ohc_pipeline.py plot \
+python3 /helpers/ihc_ohc/ihc_ohc_pipeline.py plot \
     --seg $DATA/test/009_..._seg.npy --source fused
 ```
 

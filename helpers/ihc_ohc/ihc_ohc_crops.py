@@ -34,16 +34,18 @@ train/val leakage. They are still grouped by source-image id, so
 Usage
 -----
   # in the cellpose container; /data == /media/DATA/Chris/cellpose2D
-  python /helpers/ihc_ohc_crops.py \
+  python /helpers/ihc_ohc/ihc_ohc_crops.py \
       --data_dir /data/to_zip/hcat-data/Confocal/Cunningham/traintest/train \
-      --out /helpers/crops_train.npz --preview /helpers/crops_train_preview.png
+      --out /helpers/ihc_ohc/runs/cache/crops_train.npz \
+      --preview /helpers/ihc_ohc/runs/cache/crops_train_preview.png
 
-  python /helpers/ihc_ohc_crops.py \
+  python /helpers/ihc_ohc/ihc_ohc_crops.py \
       --data_dir /data/to_zip/hcat-data/Confocal/Cunningham/traintest/test \
-      --out /helpers/crops_test.npz
+      --out /helpers/ihc_ohc/runs/cache/crops_test.npz
 """
 
 import argparse
+import datetime
 import glob
 import os
 import re
@@ -163,6 +165,41 @@ def update_pred(seg_path, **new_keys):
         np.save(fh, cur, allow_pickle=True)
     os.replace(tmp, pp)
     return pp
+
+
+# ── run-artifact organisation ──────────────────────────────────────────────────
+
+# Every train/sweep/fuse invocation gets its own timestamped subdir under the
+# config's out_dir, so previous runs are preserved automatically. Format:
+# <YYYYMMDD-HHMMSS>_<tag> (e.g., '20260520-104530_train-cnn'). The pipeline
+# orchestrator can pass a single `override` path to keep all steps in a full-
+# pipeline run grouped under one timestamp.
+
+def new_run_dir(out_dir, tag, override=None):
+    """Create + return a timestamped run subdir under `out_dir`.
+
+    If `override` is given (e.g. from --run_dir), it's used verbatim — the
+    pipeline orchestrator uses this to thread one timestamp across steps.
+    """
+    if override:
+        os.makedirs(override, exist_ok=True)
+        return override
+    os.makedirs(out_dir, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(out_dir, f"{stamp}_{tag}")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def save_run_config(run_dir, cfg, *, name="config.yaml"):
+    """Freeze the resolved config alongside the run's artifacts.
+
+    Reading any old run's config.yaml is the way to know what produced its
+    checkpoint; with that + the timestamp it's all you need to reproduce.
+    """
+    import yaml  # local to keep the module's import surface minimal
+    with open(os.path.join(run_dir, name), "w") as fh:
+        yaml.safe_dump(cfg, fh, sort_keys=False)
 
 
 # ── image loading ──────────────────────────────────────────────────────────────
