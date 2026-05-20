@@ -183,6 +183,65 @@ def cmd_predict(args):
               "--fuse", "--seg", args.seg, "--write"])
 
 
+# ── migrate-preds: move legacy in-seg prediction keys to sidecars ───────────────
+
+def cmd_migrate_preds(args):
+    """One-time housekeeping for segs from before the sidecar convention.
+
+    For each `_seg.npy` in `--dir`: any prediction keys still living in
+    the seg dict are moved to `<stem>_pred.npy` (without clobbering values
+    already in an existing sidecar — the sidecar wins on conflict) and
+    then *removed* from the seg, which is re-saved clean. This is the
+    only operation that writes to a dataset seg file, and it's opt-in.
+    Use `--dry-run` to see what would change first.
+    """
+    from ihc_ohc_crops import (
+        PRED_KEYS, iter_seg_files, pred_path, update_pred,
+    )
+    n_segs = n_keys = n_skip = n_clean = 0
+    for sp, _ in iter_seg_files(args.dir, include_augmented=args.include_augmented):
+        seg = np.load(sp, allow_pickle=True).item()
+        in_seg = [k for k in PRED_KEYS if k in seg]
+        if not in_seg:
+            n_clean += 1
+            continue
+        # Read the actual sidecar file (NOT load_pred — that has a legacy
+        # seg-fallback which would falsely report keys "already present"
+        # and let us strip them from seg without persisting → data loss).
+        pp = pred_path(sp)
+        existing = {}
+        if os.path.exists(pp):
+            try:
+                existing = np.load(pp, allow_pickle=True).item() or {}
+            except Exception:  # noqa: BLE001
+                existing = {}
+        # Migrate every in-seg key not already in the real sidecar.
+        to_move = {k: seg[k] for k in in_seg if k not in existing}
+        already = [k for k in in_seg if k in existing]
+        print(f"  {os.path.basename(sp)}: seg has {in_seg}; "
+              f"migrating {list(to_move)}"
+              + (f"; sidecar already has {already}" if already else ""))
+        n_segs += 1
+        n_keys += len(to_move)
+        n_skip += len(already)
+        if args.dry_run:
+            continue
+        # Only after the sidecar write *succeeds* may we pop from seg.
+        if to_move:
+            update_pred(sp, **to_move)
+        for k in in_seg:
+            seg.pop(k, None)
+        np.save(sp, seg)
+    print(f"\n{n_segs} segs migrated  |  {n_keys} keys moved  |  "
+          f"{n_skip} keys skipped (sidecar wins)  |  "
+          f"{n_clean} segs already clean"
+          + ("  [DRY RUN — no files written]" if args.dry_run else ""))
+    if not args.dry_run and n_segs:
+        print(f"  → sidecars written; legacy in-seg keys removed; "
+              f"check one with: python3 -c 'import numpy as np; "
+              f"print(sorted(np.load(\"<seg>\",allow_pickle=True).item().keys()))'")
+
+
 # ── plot: masks tinted by IHC/OHC ───────────────────────────────────────────────
 
 # IHC = warm, OHC = cool, unlabelled = grey. RGB, 0–1.
@@ -300,6 +359,15 @@ def parse_args():
     q.add_argument("--cnn_config", default=CNN_CFG)
     q.add_argument("--geom_config", default=GEOM_CFG)
 
+    m = sub.add_parser(
+        "migrate-preds",
+        help="move legacy in-seg prediction keys to sidecars (one-time housekeeping)")
+    m.add_argument("--dir", required=True, help="dir of _seg.npy to clean")
+    m.add_argument("--dry-run", action="store_true",
+                   help="report what would change; don't write anything")
+    m.add_argument("--include-augmented", action="store_true",
+                   help="also process augment.py's D4 copies")
+
     v = sub.add_parser("plot", help="masks tinted by IHC/OHC → PNG")
     v.add_argument("--seg", required=True)
     v.add_argument("--source", default="fused",
@@ -316,8 +384,8 @@ def parse_args():
 
 def main():
     args = parse_args()
-    {"train": cmd_train, "predict": cmd_predict,
-     "plot": cmd_plot}[args.cmd](args)
+    {"train": cmd_train, "predict": cmd_predict, "plot": cmd_plot,
+     "migrate-preds": cmd_migrate_preds}[args.cmd](args)
 
 
 if __name__ == "__main__":

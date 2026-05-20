@@ -192,10 +192,35 @@ Classifier (`ihc_ohc_config.yaml`):
 ## Inference integration
 
 `predict_seg()` (and `predict` CLI) writes `class_map_pred` /
-`class_prob` into the seg dict, leaving `masks` untouched — so
-`plot_boxes.py` and the Cellpose GUI still work, and the probability is
-available as a confidence score to fuse with the geometric classifier
-(weighted vote / tiebreaker).
+`class_prob` to a **prediction sidecar** (see *Prediction sidecars*
+below), so the dataset `_seg.npy` is never mutated — `plot_boxes.py` and
+the Cellpose GUI still work, and the probability is available as a
+confidence score to fuse with the geometric classifier (weighted vote /
+tiebreaker).
+
+## Prediction sidecars
+
+Predictions never live inside the dataset seg. Every classifier writes
+to `<stem>_pred.npy` next to the seg, holding a dict of the prediction
+keys (`class_map_pred`, `class_prob`, `class_map_geom`,
+`class_prob_geom`, `geom_flag`, `class_map_fused`, `class_prob_fused`).
+Writes are atomic-ish (tmp file + `os.replace`). The helpers live in
+[`ihc_ohc_crops.py`](ihc_ohc_crops.py): `pred_path`, `load_pred`,
+`update_pred`.
+
+`load_pred(seg_path, seg)` prefers the sidecar and falls back to the
+same keys *inside* the seg, so segs from earlier runs (when predictions
+were stored in-line) still work — no forced migration. To clean up
+legacy in-seg keys on demand:
+
+```bash
+python3 /helpers/ihc_ohc_pipeline.py migrate-preds --dir <data_dir> --dry-run
+python3 /helpers/ihc_ohc_pipeline.py migrate-preds --dir <data_dir>
+```
+
+The migrator only strips keys from the seg *after* the sidecar write
+succeeds — never silently. This is the only operation that mutates a
+dataset seg, and it's opt-in.
 
 ---
 
@@ -333,9 +358,9 @@ python3 /helpers/ihc_ohc_geom_clf.py predict \
 ```
 
 `predict` writes `class_map_geom` / `class_prob_geom` / `geom_flag` (and,
-with `--fuse`, `class_map_fused`) into the seg dict, leaving `masks` and
-the CNN's keys untouched — same non-destructive convention, so
-`plot_boxes.py` and the GUI keep working.
+with `--fuse`, `class_map_fused` / `class_prob_fused`) to the
+**prediction sidecar** `<stem>_pred.npy` — the dataset seg is never
+touched. See *Prediction sidecars* above.
 
 ## Knobs
 
@@ -382,10 +407,16 @@ python3 /helpers/ihc_ohc_pipeline.py plot \
 ```
 
 `predict` writes `class_map_pred`/`class_prob` (CNN),
-`class_map_geom`/`class_prob_geom`/`geom_flag`, and `class_map_fused`
-into the seg, non-destructively. `plot` renders the MYO7A image with
+`class_map_geom`/`class_prob_geom`/`geom_flag`, and
+`class_map_fused`/`class_prob_fused` to the **prediction sidecar**
+`<stem>_pred.npy` — the dataset seg stays untouched. `plot` reads
+predictions from the sidecar (or, for backward compatibility, from a
+seg that still carries them in-line) and renders the MYO7A image with
 each mask tinted IHC (red) / OHC (blue), geometry-flagged cells ringed,
-and the vs-GT accuracy in the title → PNG next to the seg.
+and the vs-GT accuracy in the title → PNG next to the seg. To clean up
+segs from runs predating the sidecar convention, use
+`migrate-preds --dir <data_dir>` (opt-in; safe — strips legacy keys
+only after they are persisted in the sidecar).
 
 ## Why this over early fusion
 

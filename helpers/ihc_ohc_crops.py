@@ -158,7 +158,9 @@ def update_pred(seg_path, **new_keys):
             cur = {}
     cur.update({k: v for k, v in new_keys.items() if v is not None})
     tmp = pp + ".tmp"
-    np.save(tmp, cur, allow_pickle=True)
+    # write via fd so np.save doesn't auto-append '.npy' to the tmp name.
+    with open(tmp, "wb") as fh:
+        np.save(fh, cur, allow_pickle=True)
     os.replace(tmp, pp)
     return pp
 
