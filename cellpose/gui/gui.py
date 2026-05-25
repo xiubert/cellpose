@@ -593,6 +593,19 @@ class MainW(QMainWindow):
         self.celltypeBoxG.addWidget(self.CelltypeButtonC, 0, 8, 1, 1)
         self.CelltypeButtonC.setEnabled(False)
 
+        # Color key: one bold span per class in the selected manifest's
+        # configured tint. Updated whenever the dropdown selection or the
+        # registry changes — see _update_celltype_legend.
+        self.celltypeLegend = QLabel("")
+        self.celltypeLegend.setFont(self.medfont)
+        self.celltypeLegend.setTextFormat(QtCore.Qt.RichText)
+        self.celltypeLegend.setToolTip(
+            "mask tint per cell type (from the selected manifest)")
+        self.celltypeBoxG.addWidget(self.celltypeLegend, 1, 0, 1, 9)
+        self.CelltypeChooseC.currentIndexChanged.connect(
+            self._update_celltype_legend)
+        self._update_celltype_legend()
+
 
         b += 1
         self.filterBox = QGroupBox("Image filtering")
@@ -1865,6 +1878,34 @@ class MainW(QMainWindow):
         if len(self.celltype_strings) == 0:
             self.CelltypeButtonC.setEnabled(False)
         print(f"GUI_INFO: removed celltype model {path}")
+
+    def _update_celltype_legend(self):
+        """Render the color key for the currently-selected celltype model.
+
+        One bold span per class in the manifest's `classes:` map, colored
+        with that class's tint. Empty when no model is selected or the
+        manifest has no class colors.
+        """
+        idx = self.CelltypeChooseC.currentIndex()
+        if idx <= 0 or idx > len(self.celltype_strings):
+            self.celltypeLegend.setText("")
+            return
+        try:
+            manifest = celltype.load_manifest(self.celltype_strings[idx - 1])
+        except Exception:  # noqa: BLE001
+            self.celltypeLegend.setText("")
+            return
+        tints = celltype.class_colors_uint8(manifest)
+        if not tints:
+            self.celltypeLegend.setText(
+                '<i style="color: gray">no class colors in manifest</i>')
+            return
+        parts = []
+        for name, rgb in tints.items():
+            r, g, b = int(rgb[0]), int(rgb[1]), int(rgb[2])
+            parts.append(
+                f'<b><span style="color: rgb({r},{g},{b})">{name}</span></b>')
+        self.celltypeLegend.setText("&nbsp;&nbsp;".join(parts))
 
     def compute_celltype(self):
         """Run the selected celltype classifier on the current image's masks.
