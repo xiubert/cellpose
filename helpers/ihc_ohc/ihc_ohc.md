@@ -111,11 +111,29 @@ then stabilised the tail and lifted every metric further — no trade-off.
 
 ## Dependencies
 
-Beyond the cellpose env, `ihc_ohc_classifier.py` needs **PyYAML** (config)
-and **scikit-learn** (`sklearn.model_selection.GroupKFold` for CV) installed
-in the container. `ihc_ohc_crops.py` needs only cellpose's own deps
-(numpy/scipy/cv2/tifffile); matplotlib is optional (montages degrade
-gracefully if absent).
+Beyond stock `pip install cellpose` (numpy, scipy, tifffile, opencv,
+torch, torchvision, segment_anything, …), the helpers add four extras —
+listed and pinned in [`requirements.txt`](requirements.txt):
+
+| Package | Why |
+|---|---|
+| **scikit-learn** | `GroupKFold` for the CNN CV splits + `LogisticRegression`/`GradientBoostingClassifier`/`GaussianMixture`/`StandardScaler`/`KDTree` for the geom classifier + the fusion stacker. |
+| **scikit-image** | `regionprops_table` for the per-mask shape features — the geom pipeline's headline dependency. |
+| **PyYAML** | every CLI takes `--config <yaml>` as single source of truth, and the GUI celltype manifest is yaml too. |
+| **matplotlib** | crop/QC/mask previews, training-log plots, `ihc_ohc_pipeline.py plot`. Uses the `Agg` backend everywhere so no display server is needed. |
+
+Install into the live container:
+
+```bash
+podman exec cellpose pip install -r /helpers/ihc_ohc/requirements.txt
+```
+
+Or, to bake into a rebuilt image, add to the Dockerfile:
+
+```dockerfile
+RUN pip install --no-cache-dir scikit-learn==1.7.2 scikit-image==0.25.2 \
+                                PyYAML==6.0.3 matplotlib==3.10.9
+```
 
 **Container note:** the cellpose container's `/dev/shm` is only 63 MB, too
 small for PyTorch DataLoader worker IPC — keep `train.workers: 0` (the
@@ -364,15 +382,14 @@ flat for logreg; gbm ignores it (the 5 gbm rows are identical). Model
 choice barely matters anyway — fusion (0.945 → 0.981) is the real lever
 and is model-agnostic.
 
-## Dependencies
+## Dependencies (geom-specific notes)
 
-Beyond the cellpose env, `ihc_ohc_geom.py` needs **scikit-image**
-(`regionprops`; newly installed in the container) + scipy (already
-present); `ihc_ohc_geom_clf.py` needs scikit-learn (already required for
-the CNN's `GroupKFold`). **No torch** — the geometric stack stays light;
-the small metric/split/config helpers are intentionally duplicated from
-`ihc_ohc_classifier.py` (its copy is canonical — keep in sync) so the geom
-path never imports torch.
+Same shared `requirements.txt` as the CNN side — `scikit-image`
+(`regionprops`) and `scikit-learn` are both listed there. **No torch** on
+this side by design — the geometric stack stays light; the small
+metric/split/config helpers are intentionally duplicated from
+`ihc_ohc_classifier.py` (its copy is canonical — keep in sync) so the
+geom path never imports torch.
 
 ## Usage (inside the cellpose container)
 
@@ -476,3 +493,82 @@ independently, and already clears 0.98. Concatenating geom features into
 `TinyHCNet`'s embedding (Path B) would need a fresh sweep for a likely
 smaller marginal gain — deferred unless a single combined model is
 required for deployment.
+
+---
+
+# Cellpose GUI integration
+
+A "cell-type classifier" button now sits in the Cellpose GUI's left
+sidebar (commits `c6ee093` + `75d894b`). Pick a registered manifest from
+the dropdown, click **run**, and every mask gets tinted by its predicted
+class — no shell, no notebook, no editing the seg file by hand.
+
+## Manifest
+
+The GUI doesn't hardcode the IHC/OHC stack; it loads a small yaml
+**manifest** that lists which checkpoints to use. The deployed one ships
+with the helpers: [`cunningham_ihc_ohc.yaml`](cunningham_ihc_ohc.yaml).
+
+```yaml
+name: cunningham-ihc-ohc                              # label in the dropdown
+cnn_ckpt:  runs/20260519-114530_train-cnn/best.pt    # required
+geom_ckpt: runs/20260519-145037_train-geom/geom_best.pkl  # optional
+fuse_ckpt: runs/20260519-165125_fuse/fuse.pkl        # optional (needs geom_ckpt)
+classes:                                              # per-class mask tint (RGB 0–255)
+  IHC: [242, 64, 51]
+  OHC: [38, 166, 242]
+```
+
+Relative ckpt paths are resolved against the manifest's directory, so a
+`runs/<stamp>_…/` dir can carry its own manifest and stay portable.
+
+## How it's wired
+
+Three new pieces in [`cellpose/gui/`](../../cellpose/gui/) glue the
+helpers to the GUI in-process (no subprocess, no extra container hop):
+
+| File | Role |
+|---|---|
+| [`celltype.py`](../../cellpose/gui/celltype.py) | Manifest I/O + registry (`~/.cellpose/gui_celltype_models.txt`); `run_celltype(manifest, seg_path)` lazy-imports `ihc_ohc_classifier`/`ihc_ohc_geom_clf` and writes the usual sidecar. |
+| [`gui.py`](../../cellpose/gui/gui.py) | Adds the "cell-type classifier" QGroupBox (dropdown + run button) and the `compute_celltype` handler that drives it. |
+| [`menus.py`](../../cellpose/gui/menus.py) | Adds **Models → Add cell-type classifier (manifest .yaml)** and **Remove selected …** entries. |
+
+`celltype.run_celltype` walks the priority `class_map_fused →
+class_map_geom → class_map_pred` so whichever level of the stack is
+present in the manifest is what colours the masks. The sidecar is wiped
+before each run so a mask renumbering between sessions can't leave
+orphan cell IDs behind.
+
+## Using it
+
+```text
+Models menu → Add cell-type classifier (manifest .yaml)
+   → pick /helpers/ihc_ohc/cunningham_ihc_ohc.yaml
+sidebar "cell-type classifier" combo → choose 'cunningham-ihc-ohc'
+   → click run
+```
+
+The button only enables when (a) ≥1 manifest is registered and (b) the
+GUI has masks loaded. Each click:
+
+1. Verifies the on-disk `<stem>_seg.npy` matches the GUI's current
+   masks. If they differ, the click is refused and the user is prompted
+   to `Ctrl+S` first (with a **WARNING** if the seg contains a
+   ground-truth `class_map` — `io._save_sets` would silently drop it).
+2. Wipes any stale `<stem>_pred.npy` sidecar.
+3. Runs `predict_seg(cnn_ckpt, seg)` → and if `geom_ckpt` is set,
+   `predict_seg_geom(geom_ckpt, seg, fuse_ckpt=…)`.
+4. Reads the resulting sidecar via `load_pred()` and applies the
+   manifest's per-class RGB tint to each mask.
+
+## Constraints / gotchas
+
+- **2D only.** The classifier indexes `seg["masks"]` as a 2-D array; the
+  GUI refuses to run if `NZ != 1` (commit `75d894b`).
+- **PyYAML is required when the user actually uses celltype.** Import is
+  lazy so cellpose GUI environments without it still start; install via
+  the [`requirements.txt`](requirements.txt) before clicking *run*.
+- **Containerised launch.** `celltype.py` adds `/helpers/ihc_ohc` to
+  `sys.path` on first use, so the GUI process needs to be running inside
+  (or with that path mounted into) the cellpose container — same as the
+  rest of this pipeline.
