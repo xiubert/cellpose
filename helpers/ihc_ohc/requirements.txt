@@ -1,0 +1,28 @@
+# Additional Python packages this IHC/OHC pipeline needs on top of stock
+# cellpose. Stock `pip install cellpose` already pulls numpy, scipy,
+# tifffile, opencv-python-headless, torch, torchvision, segment_anything,
+# etc. — these four are the only extras the helpers import.
+#
+# Install into the cellpose container:
+#   podman exec cellpose pip install -r /helpers/ihc_ohc/requirements.txt
+#
+# Or, to bake into a rebuilt image, add to the Dockerfile:
+#   RUN pip install --no-cache-dir scikit-learn==1.7.2 scikit-image==0.25.2 \
+#                                   PyYAML==6.0.3 matplotlib==3.10.9
+#
+# Versions pinned to what was verified working in this session; loosen if
+# rebuilding is needed for a newer Python or CUDA.
+#
+# What each one is used for:
+#   scikit-learn   GroupKFold, LogReg, GBM, GMM, StandardScaler, kNN
+#                  (CNN cv splits + geom classifier + fusion stacker)
+#   scikit-image   regionprops_table for the per-mask shape features
+#                  (the geom pipeline's headline dependency)
+#   PyYAML         every CLI takes --config <yaml> as single source of truth
+#   matplotlib     crop/QC/mask previews, training-log plots, ihc_ohc plot
+#                  (always uses the Agg backend — no display server needed)
+
+scikit-learn==1.7.2
+scikit-image==0.25.2
+PyYAML==6.0.3
+matplotlib==3.10.9
