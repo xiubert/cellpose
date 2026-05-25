@@ -15,8 +15,10 @@ cnn_ckpt:  runs/20260519-114530_train-cnn/best.pt
 geom_ckpt: runs/20260519-145037_train-geom/geom_best.pkl
 fuse_ckpt: runs/20260519-165125_fuse/fuse.pkl
 
-# Per-class mask tint (RGB 0–255). IHC warm, OHC cool — mirrors the
-# pipeline's plot.py palette.
+# Per-class mask tint (RGB 0–255). Magenta + cyan so the overlay stays
+# readable over either the red or the green fluorescence channel (the
+# pipeline's plot.py uses red/blue, but that palette is for grayscale
+# export plots, not the GUI overlay).
 classes:
-  IHC: [242, 64, 51]
-  OHC: [38, 166, 242]
+  IHC: [232, 38, 220]   # magenta
+  OHC: [40, 220, 230]   # cyan
