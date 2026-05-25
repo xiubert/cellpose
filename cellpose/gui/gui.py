@@ -536,7 +536,7 @@ class MainW(QMainWindow):
         self.additional_seg_settings_qcollapsible._toggle_btn.setChecked(False)
 
         b += 1
-        self.modelBox = QGroupBox("user-trained models")
+        self.modelBox = QGroupBox("cellpose cell mask model (user-trained)")
         self.modelBoxG = QGridLayout()
         self.modelBox.setLayout(self.modelBoxG)
         self.l0.addWidget(self.modelBox, b, 0, 1, 9)
