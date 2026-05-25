@@ -656,7 +656,18 @@ class ImageDraw(pg.ImageItem):
                     if ev.button() == QtCore.Qt.LeftButton and not ev.double():
                         idx = self.parent.cellpix[self.parent.currentZ][y, x]
                         if idx > 0:
-                            if ev.modifiers() & (QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier) == (QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier):
+                            # Celltype labeling mode wins over every other
+                            # click action (no delete/merge/select while
+                            # labeling — only assign). Skipped on modifier
+                            # clicks so the user can still Ctrl+click a
+                            # bad mask to delete it without exiting mode.
+                            if getattr(self.parent, "labeling_celltype", False) \
+                                    and not (ev.modifiers() & (
+                                        QtCore.Qt.ControlModifier |
+                                        QtCore.Qt.ShiftModifier)):
+                                ev.accept()
+                                self.parent.assign_celltype(int(idx))
+                            elif ev.modifiers() & (QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier) == (QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier):
                                 ev.accept()
                                 self.parent.merge_cells(idx)
                             elif ev.modifiers() & QtCore.Qt.ControlModifier:

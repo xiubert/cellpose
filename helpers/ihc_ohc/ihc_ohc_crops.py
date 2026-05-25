@@ -106,11 +106,17 @@ def tif_for_seg(seg_path):
 # ── prediction sidecar (don't mutate the dataset) ───────────────────────────────
 
 # Every key produced downstream of segmentation: classifier (CNN), geom,
-# and fusion. The sidecar is the single source of truth for these; the
-# `_seg.npy` dataset files stay untouched.
+# fusion, and user-applied corrections. The sidecar is the single source
+# of truth for these; the `_seg.npy` dataset files stay untouched.
+#
+# class_map_user is the GUI's manual-labeling channel — it persists
+# across re-runs of the model so corrections survive a fresh predict,
+# and resolve_training_label_map merges it into the label set used by
+# the crops/geom builders so corrections feed straight into training.
 PRED_KEYS = ("class_map_pred", "class_prob",
              "class_map_geom", "class_prob_geom", "geom_flag",
-             "class_map_fused", "class_prob_fused")
+             "class_map_fused", "class_prob_fused",
+             "class_map_user")
 
 
 def pred_path(seg_path):
@@ -304,6 +310,30 @@ def resolve_class_map(seg, seg_path, data_dir, xml_dir=None):
     return derive_class_map_from_xml(seg["masks"], xml_path), "xml"
 
 
+def resolve_training_label_map(seg, seg_path, data_dir, xml_dir=None):
+    """resolve_class_map + user GUI corrections merged on top (user wins per cell).
+
+    Reads `class_map_user` from the sidecar (where the GUI's celltype
+    labeling tool writes it) and overlays each entry on the GT map from
+    `resolve_class_map`. Use this — not `resolve_class_map` directly —
+    when building training data so user corrections flow into the next
+    train run without anyone re-running label_xfer or hand-editing
+    seg.npy files.
+
+    `src` carries the provenance into the npz: "seg", "xml", "seg+user",
+    "xml+user", or "user" (when GT was missing).
+    """
+    cm, src = resolve_class_map(seg, seg_path, data_dir, xml_dir)
+    pred = load_pred(seg_path, seg)
+    user = pred.get("class_map_user") or {}
+    if not user:
+        return cm, src
+    cm = dict(cm)
+    cm.update({int(k): str(v) for k, v in user.items() if v in CLASS_TO_IDX})
+    src = "user" if src == "none" else f"{src}+user"
+    return cm, src
+
+
 # ── crop expansion (the fiddly part) ───────────────────────────────────────────
 
 def cell_bbox(masks, cell_id):
@@ -409,7 +439,8 @@ def build_crop_dataset(data_dir, *, out_size=64, pad_frac=0.5, pad_px=None,
             print(f"  skip {os.path.basename(seg_path)} (no masks)")
             continue
 
-        class_map, src = resolve_class_map(seg, seg_path, data_dir, xml_dir)
+        class_map, src = resolve_training_label_map(
+            seg, seg_path, data_dir, xml_dir)
         src_counter[src] = src_counter.get(src, 0) + 1
         if not class_map:
             print(f"  skip {os.path.basename(seg_path)} (no class labels)")

@@ -42,7 +42,8 @@ Each cell also gets a `flag` (and a bitmask of reasons) marking
 edge extrapolation, or too few cells in the image — for human review.
 
 Labels come from the same source as the CNN: label_xfer.py's `class_map`
-in the seg dict, else the original VOC XML (resolve_class_map, reused from
+in the seg dict, plus any user corrections from the sidecar's class_map_user
+(resolve_training_label_map, reused from
 ihc_ohc_crops). Augmented D4 copies are skipped by default and grouped by
 source image either way, so a cochlea never straddles the train/val split.
 
@@ -71,7 +72,7 @@ from skimage.measure import regionprops_table
 # geometric and CNN tables are built over the *identical* set of cells and
 # the *identical* leak-free image grouping.
 from ihc_ohc_crops import (
-    CLASS_NAMES, CLASS_TO_IDX, iter_seg_files, resolve_class_map, seg_stem,
+    CLASS_NAMES, CLASS_TO_IDX, iter_seg_files, resolve_training_label_map, seg_stem,
 )
 
 # Bitmask reasons for the per-cell "looks weird" flag (≥1 → human review).
@@ -369,7 +370,7 @@ def build_geom_dataset(data_dir, *, k_neighbors=6, include_augmented=False,
         if seg.get("masks") is None:
             print(f"  skip {os.path.basename(seg_path)} (no masks)")
             continue
-        class_map, src = resolve_class_map(seg, seg_path, data_dir, xml_dir)
+        class_map, src = resolve_training_label_map(seg, seg_path, data_dir, xml_dir)
         src_counter[src] = src_counter.get(src, 0) + 1
         if not class_map:
             print(f"  skip {os.path.basename(seg_path)} (no class labels)")
@@ -464,7 +465,7 @@ def save_preview(path, data_dir, *, k_neighbors=6, max_images=12,
         seg = np.load(seg_path, allow_pickle=True).item()
         if seg.get("masks") is None:
             continue
-        gt, _ = resolve_class_map(seg, seg_path, data_dir, xml_dir)
+        gt, _ = resolve_training_label_map(seg, seg_path, data_dir, xml_dir)
         cids, feats, flags, cents = geom_features_for_seg(
             seg, k_neighbors=k_neighbors)
         if len(cids) == 0:

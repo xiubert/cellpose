@@ -137,16 +137,20 @@ def class_colors_uint8(manifest):
 # ── prediction ──────────────────────────────────────────────────────────────────
 
 # Priority order for which prediction source to display when several are
-# present in the sidecar — late-fusion is the canonical deployed label.
-_SOURCE_PRIORITY = ("class_map_fused", "class_map_geom", "class_map_pred")
+# present in the sidecar. User corrections override every model output —
+# that's the whole point of the labeling tool. Late-fusion is the
+# canonical deployed model label below that.
+_SOURCE_PRIORITY = ("class_map_user", "class_map_fused",
+                    "class_map_geom", "class_map_pred")
 
 
 def run_celltype(manifest, seg_path):
     """Predict celltype for every mask in seg_path; write back to the sidecar.
 
-    In-process call to the IHC/OHC helpers (no subprocess). The sidecar
-    is wiped first so stale predictions from a previous run that used a
-    different mask numbering don't linger.
+    In-process call to the IHC/OHC helpers (no subprocess). Model-produced
+    keys are wiped first so stale entries from a prior mask numbering
+    don't linger, but `class_map_user` is preserved across the wipe so
+    the user's manual corrections survive a fresh predict.
 
     Returns
     -------
@@ -156,7 +160,7 @@ def run_celltype(manifest, seg_path):
     _ensure_helpers_on_path()
     # Lazy imports keep torch/sklearn off the GUI's startup path.
     from ihc_ohc_classifier import predict_seg  # type: ignore
-    from ihc_ohc_crops import load_pred, pred_path  # type: ignore
+    from ihc_ohc_crops import load_pred, pred_path, update_pred  # type: ignore
 
     cnn = manifest.get("cnn_ckpt")
     geom = manifest.get("geom_ckpt")
@@ -166,10 +170,17 @@ def run_celltype(manifest, seg_path):
     if fuse and not geom:
         raise RuntimeError("manifest sets fuse_ckpt but no geom_ckpt")
 
-    # Drop any stale sidecar so mask renumbering between sessions can't
-    # leave orphan cids behind.
+    # Read existing user labels before the wipe so we can restore them
+    # after predict_seg/predict_seg_geom write fresh model output.
     pp = pred_path(seg_path)
+    user_labels = {}
     if os.path.exists(pp):
+        try:
+            cur = np.load(pp, allow_pickle=True).item() or {}
+            user_labels = {int(k): str(v)
+                           for k, v in (cur.get("class_map_user") or {}).items()}
+        except Exception:  # noqa: BLE001
+            user_labels = {}
         try:
             os.remove(pp)
         except OSError:
@@ -180,9 +191,41 @@ def run_celltype(manifest, seg_path):
         from ihc_ohc_geom_clf import predict_seg_geom  # type: ignore
         predict_seg_geom(geom, seg_path, fuse_ckpt=fuse, write=True)
 
+    if user_labels:
+        update_pred(seg_path, class_map_user=user_labels)
+
     pred = load_pred(seg_path)
     for key in _SOURCE_PRIORITY:
         cmap = pred.get(key)
         if cmap:
             return {int(k): str(v) for k, v in cmap.items()}, key
     return {}, ""
+
+
+# ── manual labeling ────────────────────────────────────────────────────────────
+
+def set_user_label(seg_path, cell_id, class_name):
+    """Persist one (cell_id → class_name) user label to the sidecar.
+
+    Read-modify-writes `class_map_user` so previously-set user labels in
+    the same sidecar are preserved (update_pred merges keys but replaces
+    each key's value wholesale). The write is atomic via update_pred's
+    tmp-file + os.replace.
+    """
+    _ensure_helpers_on_path()
+    from ihc_ohc_crops import load_pred, update_pred  # type: ignore
+
+    pred = load_pred(seg_path)
+    cmu = {int(k): str(v) for k, v in (pred.get("class_map_user") or {}).items()}
+    cmu[int(cell_id)] = str(class_name)
+    update_pred(seg_path, class_map_user=cmu)
+    return cmu
+
+
+def get_user_labels(seg_path):
+    """Read the sidecar's class_map_user, empty dict if none. No I/O cost
+    beyond load_pred (sidecar is small)."""
+    _ensure_helpers_on_path()
+    from ihc_ohc_crops import load_pred  # type: ignore
+    pred = load_pred(seg_path)
+    return {int(k): str(v) for k, v in (pred.get("class_map_user") or {}).items()}

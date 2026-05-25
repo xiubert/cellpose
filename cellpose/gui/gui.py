@@ -602,9 +602,39 @@ class MainW(QMainWindow):
         self.celltypeLegend.setToolTip(
             "mask tint per cell type (from the selected manifest)")
         self.celltypeBoxG.addWidget(self.celltypeLegend, 1, 0, 1, 9)
+
+        # Manual labeling row: pick the active class, click "label" to
+        # enter labeling mode, then left-click any mask to assign it.
+        # The dropdown is populated from the selected manifest's
+        # `classes:` map (see _update_celltype_legend).
+        self.CelltypeLabelChooseC = QComboBox()
+        self.CelltypeLabelChooseC.setFont(self.medfont)
+        self.CelltypeLabelChooseC.addItem("class to assign")
+        self.CelltypeLabelChooseC.setFixedWidth(175)
+        self.CelltypeLabelChooseC.setToolTip(
+            "active label applied when you click a mask in labeling mode")
+        self.celltypeBoxG.addWidget(self.CelltypeLabelChooseC, 2, 0, 1, 8)
+
+        self.CelltypeLabelButtonC = QPushButton(u"label")
+        self.CelltypeLabelButtonC.setFont(self.medfont)
+        self.CelltypeLabelButtonC.setFixedWidth(35)
+        self.CelltypeLabelButtonC.setToolTip(
+            "toggle labeling mode — left-click any mask to apply the "
+            "active class; corrections persist to <stem>_pred.npy and "
+            "feed into the next training rebuild via class_map_user")
+        self.CelltypeLabelButtonC.clicked.connect(self.toggle_celltype_labeling)
+        self.celltypeBoxG.addWidget(self.CelltypeLabelButtonC, 2, 8, 1, 1)
+        self.CelltypeLabelButtonC.setEnabled(False)
+
         self.CelltypeChooseC.currentIndexChanged.connect(
             self._update_celltype_legend)
         self._update_celltype_legend()
+
+        # Labeling-mode state — toggled by toggle_celltype_labeling, read
+        # by ImageDraw.mouseClickEvent (in guiparts) to route left-clicks
+        # to assign_celltype instead of select_cell.
+        self.labeling_celltype = False
+        self.labeling_tints = {}
 
 
         b += 1
@@ -814,8 +844,9 @@ class MainW(QMainWindow):
     def enable_buttons(self):
         if len(self.model_strings) > 0:
             self.ModelButtonC.setEnabled(True)
-        self.CelltypeButtonC.setEnabled(
-            len(self.celltype_strings) > 0 and self.ncells.get() > 0)
+        ct_ready = len(self.celltype_strings) > 0 and self.ncells.get() > 0
+        self.CelltypeButtonC.setEnabled(ct_ready and not self.labeling_celltype)
+        self.CelltypeLabelButtonC.setEnabled(ct_ready)
         for i in range(len(self.StyleButtons)):
             self.StyleButtons[i].setEnabled(True)
 
@@ -841,6 +872,7 @@ class MainW(QMainWindow):
         if len(self.model_strings) > 0:
             self.ModelButtonC.setEnabled(False)
         self.CelltypeButtonC.setEnabled(False)
+        self.CelltypeLabelButtonC.setEnabled(False)
         for i in range(len(self.StyleButtons)):
             self.StyleButtons[i].setEnabled(False)
         self.newmodel.setEnabled(False)
@@ -893,8 +925,9 @@ class MainW(QMainWindow):
             self.DeleteMultipleROIButton.setEnabled(False)
             self.DoneDeleteMultipleROIButton.setEnabled(False)
             self.CancelDeleteMultipleROIButton.setEnabled(False)
-        self.CelltypeButtonC.setEnabled(
-            has_cells and len(self.celltype_strings) > 0)
+        ct_ready = has_cells and len(self.celltype_strings) > 0
+        self.CelltypeButtonC.setEnabled(ct_ready and not self.labeling_celltype)
+        self.CelltypeLabelButtonC.setEnabled(ct_ready)
 
     def remove_action(self):
         if self.selected > 0:
@@ -1861,6 +1894,7 @@ class MainW(QMainWindow):
         self.CelltypeChooseC.setCurrentIndex(len(self.celltype_strings))
         if self.ncells.get() > 0:
             self.CelltypeButtonC.setEnabled(True)
+            self.CelltypeLabelButtonC.setEnabled(True)
         print(f"GUI_INFO: registered celltype model '{manifest.get('name')}' "
               f"({path})")
 
@@ -1877,15 +1911,140 @@ class MainW(QMainWindow):
         self.CelltypeChooseC.setCurrentIndex(0)
         if len(self.celltype_strings) == 0:
             self.CelltypeButtonC.setEnabled(False)
+            self.CelltypeLabelButtonC.setEnabled(False)
+            # If we were mid-labeling against this manifest, bail out.
+            if self.labeling_celltype:
+                self.toggle_celltype_labeling()
         print(f"GUI_INFO: removed celltype model {path}")
 
-    def _update_celltype_legend(self):
-        """Render the color key for the currently-selected celltype model.
+    def toggle_celltype_labeling(self):
+        """Enter or exit manual labeling mode.
 
-        One bold span per class in the manifest's `classes:` map, colored
-        with that class's tint. Empty when no model is selected or the
-        manifest has no class colors.
+        Enter: validate (model selected, classes available, seg exists
+        on disk matching GUI masks), unselect any current cell, mark
+        the button pressed, exit segmentation/celltype actions. While
+        active, ImageDraw.mouseClickEvent routes left-clicks on masks
+        to assign_celltype instead of select_cell.
+
+        Exit: clear the flag, restore button styling.
         """
+        if self.labeling_celltype:
+            self.labeling_celltype = False
+            self.CelltypeLabelButtonC.setText("label")
+            self.CelltypeLabelButtonC.setStyleSheet(self.styleUnpressed)
+            self.CelltypeButtonC.setEnabled(
+                self.ncells.get() > 0 and len(self.celltype_strings) > 0)
+            self.unselect_cell()
+            return
+
+        idx = self.CelltypeChooseC.currentIndex()
+        if idx <= 0 or idx > len(self.celltype_strings):
+            print("ERROR: select a celltype model first")
+            return
+        if not self.filename:
+            print("ERROR: no image loaded")
+            return
+        if self.NZ != 1:
+            print("ERROR: celltype labeling is 2D-only; current image is 3D")
+            return
+        if self.ncells.get() == 0:
+            print("ERROR: no masks to label — segment or load masks first")
+            return
+        if not self.labeling_tints:
+            print("ERROR: selected manifest has no class colors — cannot label")
+            return
+
+        # Same on-disk-vs-GUI check as compute_celltype: refuse to label
+        # against a stale seg so the sidecar's user labels stay keyed to
+        # the right mask numbering.
+        seg_path = os.path.splitext(self.filename)[0] + "_seg.npy"
+        gui_masks = np.asarray(self.cellpix).squeeze()
+        if not os.path.exists(seg_path):
+            io._save_sets(self)
+        else:
+            try:
+                disk = np.load(seg_path, allow_pickle=True).item()
+            except Exception as e:  # noqa: BLE001
+                print(f"ERROR: cannot read {seg_path}: {e}")
+                return
+            disk_masks = np.asarray(disk.get("masks")).squeeze()
+            if disk_masks.shape != gui_masks.shape or not np.array_equal(
+                    disk_masks, gui_masks):
+                msg = ("ERROR: on-disk masks differ from GUI state — "
+                       "save masks (Ctrl+S) before entering labeling mode")
+                if "class_map" in disk:
+                    msg += ("\n  WARNING: this seg contains a ground-truth "
+                            "`class_map` key. io._save_sets does NOT persist "
+                            "it, so saving will drop the GT labels — back up "
+                            f"{os.path.basename(seg_path)} first if you need "
+                            "to keep them.")
+                print(msg)
+                return
+
+        self.unselect_cell()
+        self.labeling_celltype = True
+        self.CelltypeLabelButtonC.setText("done")
+        self.CelltypeLabelButtonC.setStyleSheet(self.stylePressed)
+        # Block re-running the model while labeling so a click doesn't
+        # accidentally restart prediction mid-label.
+        self.CelltypeButtonC.setEnabled(False)
+        # Make sure masks are visible — labeling without seeing them is silly.
+        if not self.masksOn:
+            self.MCheckBox.setChecked(True)
+        # If the dropdown is still on the placeholder, pre-select the
+        # first real class so the very first click already does something.
+        if self.CelltypeLabelChooseC.currentIndex() == 0 and \
+                self.CelltypeLabelChooseC.count() > 1:
+            self.CelltypeLabelChooseC.setCurrentIndex(1)
+        print(f"GUI_INFO: celltype labeling ON — left-click any mask to "
+              f"assign '{self.CelltypeLabelChooseC.currentText()}'")
+
+    def assign_celltype(self, cid):
+        """Apply the active label class to one mask.
+
+        Wired from ImageDraw.mouseClickEvent when labeling_celltype is
+        on. Writes to <stem>_pred.npy:class_map_user (atomic) and
+        retints cellcolors[cid] in place.
+        """
+        if cid < 1 or cid > self.ncells.get():
+            return
+        cls = self.CelltypeLabelChooseC.currentText()
+        if cls not in self.labeling_tints:
+            print(f"ERROR: '{cls}' not in active manifest's classes")
+            return
+        if not self.filename:
+            return
+        seg_path = os.path.splitext(self.filename)[0] + "_seg.npy"
+        if not os.path.exists(seg_path):
+            print(f"ERROR: cannot persist label — {seg_path} missing")
+            return
+        try:
+            celltype.set_user_label(seg_path, cid, cls)
+        except Exception as e:  # noqa: BLE001
+            print(f"ERROR: cannot write user label: {e}")
+            return
+        self.cellcolors[cid] = self.labeling_tints[cls]
+        # draw_layer rebuilds layerz from cellcolors[cellpix]; cheap
+        # enough per click that no incremental update is needed.
+        self.draw_layer()
+        self.update_layer()
+        print(f"GUI_INFO: cell {cid} → {cls}")
+
+    def _update_celltype_legend(self):
+        """Render the color key for the currently-selected celltype model
+        and repopulate the labeling-class dropdown.
+
+        Called whenever the model dropdown changes or the registry is
+        edited — keeps the legend, the class dropdown, and the cached
+        `labeling_tints` all in sync with the active manifest.
+        """
+        # Reset label-side state; we'll repopulate from the active manifest.
+        self.labeling_tints = {}
+        self.CelltypeLabelChooseC.blockSignals(True)
+        self.CelltypeLabelChooseC.clear()
+        self.CelltypeLabelChooseC.addItem("class to assign")
+        self.CelltypeLabelChooseC.blockSignals(False)
+
         idx = self.CelltypeChooseC.currentIndex()
         if idx <= 0 or idx > len(self.celltype_strings):
             self.celltypeLegend.setText("")
@@ -1900,6 +2059,9 @@ class MainW(QMainWindow):
             self.celltypeLegend.setText(
                 '<i style="color: gray">no class colors in manifest</i>')
             return
+        self.labeling_tints = tints
+        for name in tints:
+            self.CelltypeLabelChooseC.addItem(name)
         parts = []
         for name, rgb in tints.items():
             r, g, b = int(rgb[0]), int(rgb[1]), int(rgb[2])
