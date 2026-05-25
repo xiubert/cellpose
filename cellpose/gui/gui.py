@@ -15,7 +15,7 @@ import numpy as np
 from scipy.stats import mode
 import cv2
 
-from . import guiparts, menus, io
+from . import guiparts, menus, io, celltype
 from .. import models, core, dynamics, version, train
 from ..utils import download_url_to_file, masks_to_outlines, diameters
 from ..io import get_image_files, imsave, imread
@@ -566,6 +566,35 @@ class MainW(QMainWindow):
 
 
         b += 1
+        self.celltypeBox = QGroupBox("cell-type classifier")
+        self.celltypeBoxG = QGridLayout()
+        self.celltypeBox.setLayout(self.celltypeBoxG)
+        self.l0.addWidget(self.celltypeBox, b, 0, 1, 9)
+        self.celltypeBox.setFont(self.boldfont)
+
+        self.celltype_strings = celltype.list_celltype_models()
+        self.CelltypeChooseC = QComboBox()
+        self.CelltypeChooseC.setFont(self.medfont)
+        self.CelltypeChooseC.addItems(["celltype models"])
+        for path in self.celltype_strings:
+            self.CelltypeChooseC.addItem(celltype.display_name(path))
+        self.CelltypeChooseC.setFixedWidth(175)
+        self.CelltypeChooseC.setToolTip(
+            'register a cell-type classifier (manifest yaml) via the '
+            '"Models" menu, then choose it here and click run')
+        self.celltypeBoxG.addWidget(self.CelltypeChooseC, 0, 0, 1, 8)
+
+        self.CelltypeButtonC = QPushButton(u"run")
+        self.CelltypeButtonC.setFont(self.medfont)
+        self.CelltypeButtonC.setFixedWidth(35)
+        self.CelltypeButtonC.setToolTip(
+            "classify every mask by cell type and recolor by class")
+        self.CelltypeButtonC.clicked.connect(self.compute_celltype)
+        self.celltypeBoxG.addWidget(self.CelltypeButtonC, 0, 8, 1, 1)
+        self.CelltypeButtonC.setEnabled(False)
+
+
+        b += 1
         self.filterBox = QGroupBox("Image filtering")
         self.filterBox.setFont(self.boldfont)
         self.filterBox_grid_layout = QGridLayout()
@@ -772,6 +801,8 @@ class MainW(QMainWindow):
     def enable_buttons(self):
         if len(self.model_strings) > 0:
             self.ModelButtonC.setEnabled(True)
+        self.CelltypeButtonC.setEnabled(
+            len(self.celltype_strings) > 0 and self.ncells.get() > 0)
         for i in range(len(self.StyleButtons)):
             self.StyleButtons[i].setEnabled(True)
 
@@ -796,6 +827,7 @@ class MainW(QMainWindow):
     def disable_buttons_removeROIs(self):
         if len(self.model_strings) > 0:
             self.ModelButtonC.setEnabled(False)
+        self.CelltypeButtonC.setEnabled(False)
         for i in range(len(self.StyleButtons)):
             self.StyleButtons[i].setEnabled(False)
         self.newmodel.setEnabled(False)
@@ -831,7 +863,8 @@ class MainW(QMainWindow):
             self.saveROIs.setEnabled(False)
 
     def toggle_removals(self):
-        if self.ncells > 0:
+        has_cells = self.ncells.get() > 0
+        if has_cells:
             self.ClearButton.setEnabled(True)
             self.remcell.setEnabled(True)
             self.undo.setEnabled(True)
@@ -847,6 +880,8 @@ class MainW(QMainWindow):
             self.DeleteMultipleROIButton.setEnabled(False)
             self.DoneDeleteMultipleROIButton.setEnabled(False)
             self.CancelDeleteMultipleROIButton.setEnabled(False)
+        self.CelltypeButtonC.setEnabled(
+            has_cells and len(self.celltype_strings) > 0)
 
     def remove_action(self):
         if self.selected > 0:
@@ -1790,6 +1825,131 @@ class MainW(QMainWindow):
     def remove_model(self):
         io._remove_model(self)
         return
+
+    def add_celltype_model(self):
+        """Pick a manifest yaml and register it as a cell-type classifier."""
+        from qtpy.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Register cell-type classifier (manifest .yaml)",
+            filter="YAML (*.yaml *.yml)")
+        if not path:
+            return
+        try:
+            manifest = celltype.load_manifest(path)
+        except Exception as e:  # noqa: BLE001
+            print(f"ERROR: invalid manifest {path}: {e}")
+            return
+        added = celltype.add_celltype_model(path)
+        if not added:
+            print(f"GUI_INFO: celltype model already registered: {path}")
+            return
+        self.celltype_strings = celltype.list_celltype_models()
+        self.CelltypeChooseC.addItem(manifest.get("name") or os.path.basename(path))
+        self.CelltypeChooseC.setCurrentIndex(len(self.celltype_strings))
+        if self.ncells.get() > 0:
+            self.CelltypeButtonC.setEnabled(True)
+        print(f"GUI_INFO: registered celltype model '{manifest.get('name')}' "
+              f"({path})")
+
+    def remove_celltype_model(self):
+        """Remove the currently selected celltype model from the registry."""
+        idx = self.CelltypeChooseC.currentIndex()
+        if idx <= 0 or idx > len(self.celltype_strings):
+            print("ERROR: no celltype model selected to remove")
+            return
+        path = self.celltype_strings[idx - 1]
+        celltype.remove_celltype_model(path)
+        self.CelltypeChooseC.removeItem(idx)
+        self.celltype_strings = celltype.list_celltype_models()
+        self.CelltypeChooseC.setCurrentIndex(0)
+        if len(self.celltype_strings) == 0:
+            self.CelltypeButtonC.setEnabled(False)
+        print(f"GUI_INFO: removed celltype model {path}")
+
+    def compute_celltype(self):
+        """Run the selected celltype classifier on the current image's masks.
+
+        Saves the GUI's current masks to <stem>_seg.npy first so the on-disk
+        numbering matches what the model classifies, then writes predictions
+        to <stem>_pred.npy (sidecar) and recolors each mask by its predicted
+        class.
+        """
+        idx = self.CelltypeChooseC.currentIndex()
+        if idx <= 0 or idx > len(self.celltype_strings):
+            print("ERROR: select a celltype model first")
+            return
+        if not self.filename:
+            print("ERROR: no image loaded")
+            return
+        if self.ncells.get() == 0:
+            print("ERROR: no masks to classify — segment or load masks first")
+            return
+        manifest_path = self.celltype_strings[idx - 1]
+        try:
+            manifest = celltype.load_manifest(manifest_path)
+        except Exception as e:  # noqa: BLE001
+            print(f"ERROR: cannot load manifest {manifest_path}: {e}")
+            return
+
+        # The classifier reads masks from disk. If a seg exists, refuse to
+        # run on stale state — re-saving here would clobber extras like the
+        # ground-truth `class_map` key (label_xfer.py writes that, and
+        # io._save_sets only persists a fixed key set). If no seg exists
+        # yet (e.g. fresh cpsam run), save once so there's a file to read.
+        seg_path = os.path.splitext(self.filename)[0] + "_seg.npy"
+        gui_masks = np.asarray(self.cellpix).squeeze()
+        if not os.path.exists(seg_path):
+            io._save_sets(self)
+        else:
+            try:
+                disk_masks = np.asarray(
+                    np.load(seg_path, allow_pickle=True).item().get("masks")
+                ).squeeze()
+            except Exception as e:  # noqa: BLE001
+                print(f"ERROR: cannot read {seg_path}: {e}")
+                return
+            if disk_masks.shape != gui_masks.shape or not np.array_equal(
+                    disk_masks, gui_masks):
+                print("ERROR: on-disk masks differ from GUI state — "
+                      "save masks (Ctrl+S) before running the celltype model")
+                return
+
+        self.progress.setValue(10)
+        try:
+            class_map, source = celltype.run_celltype(manifest, seg_path)
+        except Exception as e:  # noqa: BLE001
+            print(f"ERROR: celltype prediction failed: {e}")
+            self.progress.setValue(0)
+            return
+        self.progress.setValue(90)
+        if not class_map:
+            print("GUI_INFO: model produced no class assignments")
+            self.progress.setValue(0)
+            return
+
+        tints = celltype.class_colors_uint8(manifest)
+        counts = {}
+        n_recolored = 0
+        ncells = self.ncells.get()
+        for cid, cls in class_map.items():
+            counts[cls] = counts.get(cls, 0) + 1
+            if cid < 1 or cid > ncells:
+                continue
+            color = tints.get(cls)
+            if color is None:
+                continue
+            self.cellcolors[cid] = color
+            n_recolored += 1
+
+        # Repaint masks with the new colors.
+        self.masksOn = True
+        self.MCheckBox.setChecked(True)
+        self.draw_layer()
+        self.update_layer()
+        self.progress.setValue(100)
+        summary = "  ".join(f"{k} {v}" for k, v in sorted(counts.items()))
+        print(f"GUI_INFO: celltype [{manifest.get('name')}] → "
+              f"{summary}  (source: {source}, recolored {n_recolored}/{ncells})")
 
     def new_model(self):
         if self.NZ != 1:

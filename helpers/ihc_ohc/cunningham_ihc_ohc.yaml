@@ -1,0 +1,22 @@
+# Cell-type classifier manifest for the Cellpose GUI.
+#
+# Register via the GUI's Models menu → "Add cell-type classifier
+# (manifest .yaml)" → pick this file. The dropdown in the "cell-type
+# classifier" box on the left then lists it under `name`; click "run"
+# with a segmented image loaded to label every mask IHC/OHC and tint
+# the masks accordingly.
+#
+# Paths are container paths because the GUI is launched inside the
+# cellpose container (see CLAUDE.md). Relative ckpt paths are resolved
+# against this file's directory, so the manifest can travel with a run.
+
+name: cunningham-ihc-ohc
+cnn_ckpt:  runs/20260519-114530_train-cnn/best.pt
+geom_ckpt: runs/20260519-145037_train-geom/geom_best.pkl
+fuse_ckpt: runs/20260519-165125_fuse/fuse.pkl
+
+# Per-class mask tint (RGB 0–255). IHC warm, OHC cool — mirrors the
+# pipeline's plot.py palette.
+classes:
+  IHC: [242, 64, 51]
+  OHC: [38, 166, 242]

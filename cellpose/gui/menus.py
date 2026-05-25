@@ -121,6 +121,14 @@ def modelmenu(parent):
     parent.newmodel.setEnabled(False)
     model_menu.addAction(parent.newmodel)
 
+    model_menu.addSeparator()
+    addCelltype = QAction("Add cell-type classifier (manifest .yaml)", parent)
+    addCelltype.triggered.connect(parent.add_celltype_model)
+    model_menu.addAction(addCelltype)
+    removeCelltype = QAction("Remove selected cell-type classifier", parent)
+    removeCelltype.triggered.connect(parent.remove_celltype_model)
+    model_menu.addAction(removeCelltype)
+
     openTrainHelp = QAction("Training instructions", parent)
     openTrainHelp.triggered.connect(parent.train_help_window)
     model_menu.addAction(openTrainHelp)
