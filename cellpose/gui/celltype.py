@@ -144,23 +144,64 @@ _SOURCE_PRIORITY = ("class_map_user", "class_map_fused",
                     "class_map_geom", "class_map_pred")
 
 
-def run_celltype(manifest, seg_path):
-    """Predict celltype for every mask in seg_path; write back to the sidecar.
+def display_label_map(seg_path):
+    """Merge every label source in the sidecar into one display dict.
 
-    In-process call to the IHC/OHC helpers (no subprocess). Model-produced
-    keys are wiped first so stale entries from a prior mask numbering
-    don't linger, but `class_map_user` is preserved across the wipe so
-    the user's manual corrections survive a fresh predict.
+    User labels win per cell, then fused, then geom, then CNN — so a
+    cell with both a model prediction and a user correction shows the
+    user's label, while a cell with only a model prediction still
+    shows up. This is what the GUI tints with after a predict or
+    after registering new user labels.
 
     Returns
     -------
-    class_map : dict[int, str]   {mask_id: class_name}, empty on no model output
-    source_key : str             which sidecar key the map came from
+    merged : dict[int, str]   every labeled cid → class name
+    source : str              "+"-joined source tags actually present
+                              (e.g. "pred+geom+fused+user")
+    """
+    _ensure_helpers_on_path()
+    from ihc_ohc_crops import load_pred  # type: ignore
+    pred = load_pred(seg_path)
+    merged = {}
+    sources = []
+    # Apply in REVERSE priority order — later updates win, so user
+    # labels (highest priority) overwrite anything underneath them.
+    for key in reversed(_SOURCE_PRIORITY):
+        cmap = pred.get(key) or {}
+        if not cmap:
+            continue
+        merged.update({int(k): str(v) for k, v in cmap.items()})
+        sources.append(key.replace("class_map_", ""))
+    # Return source tags in priority order (user first if present),
+    # joined into a single human-readable tag for the GUI log line.
+    return merged, "+".join(reversed(sources))
+
+
+def run_celltype(manifest, seg_path):
+    """Predict celltype for every mask in seg_path; write back to the sidecar.
+
+    In-process call to the IHC/OHC helpers (no subprocess). Sidecar
+    state machine:
+      1. Snapshot any existing class_map_user from the sidecar.
+      2. Atomically rewrite the sidecar with just those user labels
+         (or remove it if none) — wipes stale model predictions
+         keyed to a prior mask numbering, but does so AFTER user
+         labels are safely persisted so a predict crash can't lose
+         them.
+      3. predict_seg / predict_seg_geom merge fresh predictions in
+         via update_pred.
+      4. display_label_map merges every source into one dict for the
+         GUI to tint by, user labels winning per cell.
+
+    Returns
+    -------
+    class_map : dict[int, str]   merged per-cell labels (user > fused > geom > pred)
+    source    : str              source tag (e.g. "fused+user")
     """
     _ensure_helpers_on_path()
     # Lazy imports keep torch/sklearn off the GUI's startup path.
     from ihc_ohc_classifier import predict_seg  # type: ignore
-    from ihc_ohc_crops import load_pred, pred_path, update_pred  # type: ignore
+    from ihc_ohc_crops import pred_path  # type: ignore
 
     cnn = manifest.get("cnn_ckpt")
     geom = manifest.get("geom_ckpt")
@@ -170,8 +211,9 @@ def run_celltype(manifest, seg_path):
     if fuse and not geom:
         raise RuntimeError("manifest sets fuse_ckpt but no geom_ckpt")
 
-    # Read existing user labels before the wipe so we can restore them
-    # after predict_seg/predict_seg_geom write fresh model output.
+    # Snapshot user labels, then atomically replace the sidecar with
+    # just those — so stale predictions can't linger AND a predict
+    # crash can't lose user work.
     pp = pred_path(seg_path)
     user_labels = {}
     if os.path.exists(pp):
@@ -181,6 +223,12 @@ def run_celltype(manifest, seg_path):
                            for k, v in (cur.get("class_map_user") or {}).items()}
         except Exception:  # noqa: BLE001
             user_labels = {}
+    if user_labels:
+        tmp = pp + ".tmp"
+        with open(tmp, "wb") as fh:
+            np.save(fh, {"class_map_user": user_labels}, allow_pickle=True)
+        os.replace(tmp, pp)
+    elif os.path.exists(pp):
         try:
             os.remove(pp)
         except OSError:
@@ -191,15 +239,7 @@ def run_celltype(manifest, seg_path):
         from ihc_ohc_geom_clf import predict_seg_geom  # type: ignore
         predict_seg_geom(geom, seg_path, fuse_ckpt=fuse, write=True)
 
-    if user_labels:
-        update_pred(seg_path, class_map_user=user_labels)
-
-    pred = load_pred(seg_path)
-    for key in _SOURCE_PRIORITY:
-        cmap = pred.get(key)
-        if cmap:
-            return {int(k): str(v) for k, v in cmap.items()}, key
-    return {}, ""
+    return display_label_map(seg_path)
 
 
 # ── manual labeling ────────────────────────────────────────────────────────────

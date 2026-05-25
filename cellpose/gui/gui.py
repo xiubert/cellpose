@@ -1934,6 +1934,9 @@ class MainW(QMainWindow):
             self.CelltypeLabelButtonC.setStyleSheet(self.styleUnpressed)
             self.CelltypeButtonC.setEnabled(
                 self.ncells.get() > 0 and len(self.celltype_strings) > 0)
+            # Re-enable manifest switching — it was locked during
+            # labeling so the active class set couldn't change under us.
+            self.CelltypeChooseC.setEnabled(True)
             self.unselect_cell()
             return
 
@@ -1988,6 +1991,10 @@ class MainW(QMainWindow):
         # Block re-running the model while labeling so a click doesn't
         # accidentally restart prediction mid-label.
         self.CelltypeButtonC.setEnabled(False)
+        # Lock the manifest dropdown: switching mid-labeling would
+        # change labeling_tints and the dropdown's class set, leaving
+        # previously-clicked labels keyed to a now-stale class list.
+        self.CelltypeChooseC.setEnabled(False)
         # Make sure masks are visible — labeling without seeing them is silly.
         if not self.masksOn:
             self.MCheckBox.setChecked(True)
