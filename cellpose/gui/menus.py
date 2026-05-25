@@ -94,7 +94,7 @@ def editmenu(parent):
     parent.remcell.setEnabled(False)
     edit_menu.addAction(parent.remcell)
 
-    parent.mergecell = QAction("FYI: Merge cells by Alt+Click", parent)
+    parent.mergecell = QAction("FYI: Merge cells by Ctrl+Shift+Click", parent)
     parent.mergecell.setEnabled(False)
     edit_menu.addAction(parent.mergecell)
 
