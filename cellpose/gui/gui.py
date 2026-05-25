@@ -1881,6 +1881,11 @@ class MainW(QMainWindow):
         if not self.filename:
             print("ERROR: no image loaded")
             return
+        if self.NZ != 1:
+            # The IHC/OHC stack is 2D-only (cochlear surface). predict_seg
+            # would index `seg["masks"]` as a 2D array and crash on 3D.
+            print("ERROR: celltype classifier is 2D-only; current image is 3D")
+            return
         if self.ncells.get() == 0:
             print("ERROR: no masks to classify — segment or load masks first")
             return
@@ -1902,16 +1907,26 @@ class MainW(QMainWindow):
             io._save_sets(self)
         else:
             try:
-                disk_masks = np.asarray(
-                    np.load(seg_path, allow_pickle=True).item().get("masks")
-                ).squeeze()
+                disk = np.load(seg_path, allow_pickle=True).item()
             except Exception as e:  # noqa: BLE001
                 print(f"ERROR: cannot read {seg_path}: {e}")
                 return
+            disk_masks = np.asarray(disk.get("masks")).squeeze()
             if disk_masks.shape != gui_masks.shape or not np.array_equal(
                     disk_masks, gui_masks):
-                print("ERROR: on-disk masks differ from GUI state — "
-                      "save masks (Ctrl+S) before running the celltype model")
+                msg = ("ERROR: on-disk masks differ from GUI state — "
+                       "save masks (Ctrl+S) before running the celltype model")
+                if "class_map" in disk:
+                    # io._save_sets writes a fixed key set that does NOT
+                    # include class_map, so Ctrl+S would silently lose the
+                    # ground-truth labels in this seg. Tell the user so they
+                    # can back up the file first.
+                    msg += ("\n  WARNING: this seg contains a ground-truth "
+                            "`class_map` key. io._save_sets does NOT persist "
+                            "it, so saving will drop the GT labels — back up "
+                            f"{os.path.basename(seg_path)} first if you need "
+                            "to keep them.")
+                print(msg)
                 return
 
         self.progress.setValue(10)

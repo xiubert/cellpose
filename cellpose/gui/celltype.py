@@ -34,7 +34,10 @@ import pathlib
 import sys
 
 import numpy as np
-import yaml
+
+# PyYAML is required for manifest I/O but not for the rest of the Cellpose
+# GUI, so it's imported lazily — `from . import celltype` at GUI startup
+# must not crash environments that don't have it installed.
 
 CELLTYPE_DIR = pathlib.Path.home().joinpath(".cellpose")
 CELLTYPE_LIST_PATH = os.fspath(CELLTYPE_DIR.joinpath("gui_celltype_models.txt"))
@@ -96,6 +99,7 @@ def remove_celltype_model(manifest_path):
 
 def load_manifest(path):
     """Read a manifest yaml; resolve relative ckpt paths against its dir."""
+    import yaml  # lazy: only needed when the user actually uses celltype
     with open(path) as fh:
         cfg = yaml.safe_load(fh) or {}
     if not isinstance(cfg, dict):
