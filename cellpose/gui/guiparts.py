@@ -656,37 +656,36 @@ class ImageDraw(pg.ImageItem):
                     if ev.button() == QtCore.Qt.LeftButton and not ev.double():
                         idx = self.parent.cellpix[self.parent.currentZ][y, x]
                         if idx > 0:
-                            # Multi-select (delete OR bulk-label) wins
-                            # over single-click labeling so users can
-                            # gather a batch via click-select even while
-                            # labeling_celltype is on. The done button
-                            # then routes to delete or bulk-label based
-                            # on labeling_celltype.
-                            if self.parent.deleting_multiple:
+                            mods = ev.modifiers() & (
+                                QtCore.Qt.ControlModifier |
+                                QtCore.Qt.ShiftModifier)
+                            # Plain click during click-select gathers
+                            # a batch (for either delete or bulk-label,
+                            # routed by done_remove_multiple_cells).
+                            # Modifier clicks fall through so Ctrl+click
+                            # / Ctrl+Shift+click keep their single-cell
+                            # meanings even during multi-select.
+                            if not mods and self.parent.deleting_multiple:
                                 if idx in self.parent.removing_cells_list:
                                     self.parent.unselect_cell_multi(idx)
                                     self.parent.removing_cells_list.remove(idx)
                                 else:
                                     self.parent.select_cell_multi(idx)
                                     self.parent.removing_cells_list.append(idx)
-                            # Celltype labeling: plain left-click on a
-                            # mask applies the active class immediately.
-                            # Skipped on modifier clicks so Ctrl+click
-                            # (delete) and Ctrl+Shift+click (merge)
-                            # still work without exiting labeling mode.
-                            elif getattr(self.parent, "labeling_celltype", False) \
-                                    and not (ev.modifiers() & (
-                                        QtCore.Qt.ControlModifier |
-                                        QtCore.Qt.ShiftModifier)):
+                            # Plain click while labeling_celltype is on
+                            # (but click-select NOT active) → assign
+                            # the active class to that one mask.
+                            elif not mods and getattr(
+                                    self.parent, "labeling_celltype", False):
                                 ev.accept()
                                 self.parent.assign_celltype(int(idx))
-                            elif ev.modifiers() & (QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier) == (QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier):
+                            elif mods == (QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier):
                                 ev.accept()
                                 self.parent.merge_cells(idx)
-                            elif ev.modifiers() & QtCore.Qt.ControlModifier:
+                            elif mods & QtCore.Qt.ControlModifier:
                                 # delete mask selected
                                 self.parent.remove_cell(idx)
-                            elif self.parent.masksOn:
+                            elif self.parent.masksOn and not self.parent.deleting_multiple:
                                 self.parent.unselect_cell()
                                 self.parent.select_cell(idx)
                             elif self.parent.deleting_multiple:
