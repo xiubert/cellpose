@@ -1929,13 +1929,32 @@ class MainW(QMainWindow):
     def toggle_celltype_labeling(self):
         """Enter or exit manual labeling mode.
 
-        Enter: validate (model selected, classes available, seg exists
-        on disk matching GUI masks), unselect any current cell, mark
-        the button pressed, exit segmentation/celltype actions. While
-        active, ImageDraw.mouseClickEvent routes left-clicks on masks
-        to assign_celltype instead of select_cell.
+        Enter:
+          - Validate: model selected with class colors, image+masks
+            loaded, NZ==1, on-disk seg matches GUI mask state.
+          - Lock the manifest dropdown so the active class set can't
+            change under us mid-labeling.
+          - Lock the celltype run button so a stray click can't
+            restart prediction mid-label.
+          - Repurpose the "delete multiple ROIs" group box title to
+            "select multiple ROIs" — the existing region-select /
+            click-select machinery is reused for bulk labeling
+            (done_remove_multiple_cells routes to assign_celltype_bulk
+            when labeling_celltype is on).
 
-        Exit: clear the flag, restore button styling.
+        Active behavior (driven by ImageDraw.mouseClickEvent):
+          - Plain left-click on a mask → assign_celltype (one cell).
+          - During click-select (deleting_multiple True), plain click
+            toggles membership of the bulk-label list instead.
+          - Ctrl+click (delete) / Ctrl+Shift+click (merge) still fire
+            their single-cell actions, even in labeling mode.
+
+        Exit:
+          - Clear labeling_celltype, restore button styling, re-enable
+            the manifest dropdown and run button.
+          - Restore the multi-ROI box title to "delete multiple ROIs".
+          - Cancel any in-progress multi-select so it can't be picked
+            up by a future delete-multiple action with stale state.
         """
         if self.labeling_celltype:
             self.labeling_celltype = False

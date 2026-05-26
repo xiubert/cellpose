@@ -688,13 +688,6 @@ class ImageDraw(pg.ImageItem):
                             elif self.parent.masksOn and not self.parent.deleting_multiple:
                                 self.parent.unselect_cell()
                                 self.parent.select_cell(idx)
-                            elif self.parent.deleting_multiple:
-                                if idx in self.parent.removing_cells_list:
-                                    self.parent.unselect_cell_multi(idx)
-                                    self.parent.removing_cells_list.remove(idx)
-                                else:
-                                    self.parent.select_cell_multi(idx)
-                                    self.parent.removing_cells_list.append(idx)
 
                         elif self.parent.masksOn and not self.parent.deleting_multiple:
                             self.parent.unselect_cell()
