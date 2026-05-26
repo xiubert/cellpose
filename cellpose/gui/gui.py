@@ -536,7 +536,7 @@ class MainW(QMainWindow):
         self.additional_seg_settings_qcollapsible._toggle_btn.setChecked(False)
 
         b += 1
-        self.modelBox = QGroupBox("cellpose cell mask model (user-trained)")
+        self.modelBox = QGroupBox("Segmentation (user-trained)")
         self.modelBoxG = QGridLayout()
         self.modelBox.setLayout(self.modelBoxG)
         self.l0.addWidget(self.modelBox, b, 0, 1, 9)
@@ -1266,9 +1266,18 @@ class MainW(QMainWindow):
 
         if self.removing_cells_list:
             self.removing_cells_list = list(set(self.removing_cells_list))
-            display_remove_list = [i - 1 for i in self.removing_cells_list]
-            print(f"GUI_INFO: removing cells: {display_remove_list}")
-            self.remove_cell(self.removing_cells_list)
+            if self.labeling_celltype:
+                # Box is repurposed for bulk labeling — apply the active
+                # class to all selected cells in one sidecar write.
+                # First drop the "selected" white overlay so the bulk
+                # repaint shows the new class tint cleanly.
+                for cid in self.removing_cells_list:
+                    self.unselect_cell_multi(cid)
+                self.assign_celltype_bulk(self.removing_cells_list)
+            else:
+                display_remove_list = [i - 1 for i in self.removing_cells_list]
+                print(f"GUI_INFO: removing cells: {display_remove_list}")
+                self.remove_cell(self.removing_cells_list)
             self.removing_cells_list.clear()
             self.unselect_cell()
         self.enable_buttons()
@@ -1937,6 +1946,11 @@ class MainW(QMainWindow):
             # Re-enable manifest switching — it was locked during
             # labeling so the active class set couldn't change under us.
             self.CelltypeChooseC.setEnabled(True)
+            # Restore the multi-ROI box's purpose to "delete".
+            self.deleteBox.setTitle("delete multiple ROIs")
+            # Clear any in-progress multi-select that carried over.
+            if self.deleting_multiple or self.removing_region:
+                self.cancel_remove_multiple()
             self.unselect_cell()
             return
 
@@ -1984,6 +1998,10 @@ class MainW(QMainWindow):
                 print(msg)
                 return
 
+        # Clean up any leftover multi-select from a prior delete attempt
+        # so it can't be silently absorbed into a bulk-label "done".
+        if self.deleting_multiple or self.removing_region:
+            self.cancel_remove_multiple()
         self.unselect_cell()
         self.labeling_celltype = True
         self.CelltypeLabelButtonC.setText("done")
@@ -1995,6 +2013,11 @@ class MainW(QMainWindow):
         # change labeling_tints and the dropdown's class set, leaving
         # previously-clicked labels keyed to a now-stale class list.
         self.CelltypeChooseC.setEnabled(False)
+        # Repurpose the multi-ROI box for bulk labeling. The underlying
+        # selection state (removing_cells_list, deleting_multiple,
+        # removing_region) is reused as-is; done_remove_multiple_cells
+        # routes to bulk-label when labeling_celltype is on.
+        self.deleteBox.setTitle("select multiple ROIs")
         # Make sure masks are visible — labeling without seeing them is silly.
         if not self.masksOn:
             self.MCheckBox.setChecked(True)
@@ -2013,7 +2036,17 @@ class MainW(QMainWindow):
         on. Writes to <stem>_pred.npy:class_map_user (atomic) and
         retints cellcolors[cid] in place.
         """
-        if cid < 1 or cid > self.ncells.get():
+        self.assign_celltype_bulk([cid])
+
+    def assign_celltype_bulk(self, cids):
+        """Apply the active label class to multiple masks at once.
+
+        One sidecar write covers the whole batch and one draw_layer
+        repaint replaces the per-call redraws — N-cell bulk labeling
+        from region-select / click-select is then a single I/O round
+        trip instead of N.
+        """
+        if not cids:
             return
         cls = self.CelltypeLabelChooseC.currentText()
         if cls not in self.labeling_tints:
@@ -2023,19 +2056,28 @@ class MainW(QMainWindow):
             return
         seg_path = os.path.splitext(self.filename)[0] + "_seg.npy"
         if not os.path.exists(seg_path):
-            print(f"ERROR: cannot persist label — {seg_path} missing")
+            print(f"ERROR: cannot persist labels — {seg_path} missing")
+            return
+        ncells = self.ncells.get()
+        valid = [int(c) for c in cids if 1 <= int(c) <= ncells]
+        if not valid:
             return
         try:
-            celltype.set_user_label(seg_path, cid, cls)
+            celltype.set_user_labels_bulk(seg_path, valid, cls)
         except Exception as e:  # noqa: BLE001
-            print(f"ERROR: cannot write user label: {e}")
+            print(f"ERROR: cannot write user labels: {e}")
             return
-        self.cellcolors[cid] = self.labeling_tints[cls]
-        # draw_layer rebuilds layerz from cellcolors[cellpix]; cheap
-        # enough per click that no incremental update is needed.
+        tint = self.labeling_tints[cls]
+        for cid in valid:
+            self.cellcolors[cid] = tint
+        # draw_layer rebuilds layerz from cellcolors[cellpix]; one
+        # repaint at the end is enough.
         self.draw_layer()
         self.update_layer()
-        print(f"GUI_INFO: cell {cid} → {cls}")
+        if len(valid) == 1:
+            print(f"GUI_INFO: cell {valid[0]} → {cls}")
+        else:
+            print(f"GUI_INFO: labeled {len(valid)} cells → {cls}")
 
     def _update_celltype_legend(self):
         """Render the color key for the currently-selected celltype model

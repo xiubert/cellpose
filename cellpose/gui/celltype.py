@@ -252,12 +252,24 @@ def set_user_label(seg_path, cell_id, class_name):
     each key's value wholesale). The write is atomic via update_pred's
     tmp-file + os.replace.
     """
+    return set_user_labels_bulk(seg_path, [cell_id], class_name)
+
+
+def set_user_labels_bulk(seg_path, cell_ids, class_name):
+    """Apply one class to many cells in a single sidecar write.
+
+    Same atomic merge semantics as `set_user_label`, but one
+    read-modify-write covers the whole batch — important for the GUI's
+    region-select / click-select bulk-labeling path where naive
+    per-cell writes would do N redundant disk round-trips.
+    """
     _ensure_helpers_on_path()
     from ihc_ohc_crops import load_pred, update_pred  # type: ignore
 
     pred = load_pred(seg_path)
     cmu = {int(k): str(v) for k, v in (pred.get("class_map_user") or {}).items()}
-    cmu[int(cell_id)] = str(class_name)
+    for cid in cell_ids:
+        cmu[int(cid)] = str(class_name)
     update_pred(seg_path, class_map_user=cmu)
     return cmu
 

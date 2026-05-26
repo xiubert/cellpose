@@ -656,12 +656,25 @@ class ImageDraw(pg.ImageItem):
                     if ev.button() == QtCore.Qt.LeftButton and not ev.double():
                         idx = self.parent.cellpix[self.parent.currentZ][y, x]
                         if idx > 0:
-                            # Celltype labeling mode wins over every other
-                            # click action (no delete/merge/select while
-                            # labeling — only assign). Skipped on modifier
-                            # clicks so the user can still Ctrl+click a
-                            # bad mask to delete it without exiting mode.
-                            if getattr(self.parent, "labeling_celltype", False) \
+                            # Multi-select (delete OR bulk-label) wins
+                            # over single-click labeling so users can
+                            # gather a batch via click-select even while
+                            # labeling_celltype is on. The done button
+                            # then routes to delete or bulk-label based
+                            # on labeling_celltype.
+                            if self.parent.deleting_multiple:
+                                if idx in self.parent.removing_cells_list:
+                                    self.parent.unselect_cell_multi(idx)
+                                    self.parent.removing_cells_list.remove(idx)
+                                else:
+                                    self.parent.select_cell_multi(idx)
+                                    self.parent.removing_cells_list.append(idx)
+                            # Celltype labeling: plain left-click on a
+                            # mask applies the active class immediately.
+                            # Skipped on modifier clicks so Ctrl+click
+                            # (delete) and Ctrl+Shift+click (merge)
+                            # still work without exiting labeling mode.
+                            elif getattr(self.parent, "labeling_celltype", False) \
                                     and not (ev.modifiers() & (
                                         QtCore.Qt.ControlModifier |
                                         QtCore.Qt.ShiftModifier)):
@@ -673,7 +686,7 @@ class ImageDraw(pg.ImageItem):
                             elif ev.modifiers() & QtCore.Qt.ControlModifier:
                                 # delete mask selected
                                 self.parent.remove_cell(idx)
-                            elif self.parent.masksOn and not self.parent.deleting_multiple:
+                            elif self.parent.masksOn:
                                 self.parent.unselect_cell()
                                 self.parent.select_cell(idx)
                             elif self.parent.deleting_multiple:
