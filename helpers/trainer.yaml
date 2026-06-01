@@ -21,3 +21,16 @@ train:
 #   learning_rate: 1.0e-6
 #   n_epochs:      40
 #   batch_size:    8
+
+# Online image-only augmentation (helpers/aug_online.py). Applied to each
+# augmented TRAIN crop after cellpose's built-in geometry (continuous rotate /
+# flip / scale / crop) and before the forward pass — labels are never touched,
+# nothing is written to disk. Omit a section (or the whole block) to disable it.
+# This replaces the photometric/D4 use of the offline augment.py for training:
+# geometry is already done on the fly, so only photometric + occlusion are added.
+augment:
+  seed: 0
+  intensity:   {p: 0.5, scale: [0.75, 1.25], gamma: [0.8, 1.25]}
+  cutout:      {p: 0.5, n: [1, 3], size_frac: [0.05, 0.15], fill: mean}
+  gauss_noise: {p: 0.3, sigma_frac: 0.05}
+  gauss_blur:  {p: 0.2, sigma: [0.5, 1.5]}

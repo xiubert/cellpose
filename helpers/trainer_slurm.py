@@ -1,9 +1,14 @@
 import logging
 import os
+import sys
 from datetime import datetime
 
 import yaml
 from cellpose import io, models, train
+
+# helpers/ on path so aug_online imports regardless of CWD
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import aug_online
 
 slurm_job_id = os.environ.get("SLURM_JOB_ID")
 logfile_name = f"run.{slurm_job_id}.log" if slurm_job_id else f"run.{datetime.now().strftime('%Y%m%d_%H%M')}.log"
@@ -42,9 +47,12 @@ config_path = os.environ.get(
 )
 
 cfg = dict(DEFAULTS)
+augment_cfg = {}
 if os.path.exists(config_path):
     with open(config_path) as f:
-        loaded = (yaml.safe_load(f) or {}).get("train") or {}
+        full = yaml.safe_load(f) or {}
+    loaded = full.get("train") or {}
+    augment_cfg = full.get("augment") or {}
     unknown = set(loaded) - set(DEFAULTS)
     if unknown:
         logger.warning("ignoring unknown train config keys: %s", sorted(unknown))
@@ -52,6 +60,10 @@ if os.path.exists(config_path):
     logger.info("loaded train config: %s", config_path)
 else:
     logger.warning("config %s not found — using built-in defaults", config_path)
+
+# Online image-only augmentation (None if no augment: block / nothing enabled)
+img_transform = aug_online.make(augment_cfg)
+logger.info("augment config: %s", augment_cfg or "(none — img_transform disabled)")
 
 weight_decay = cfg["weight_decay"]
 learning_rate = cfg["learning_rate"]
@@ -71,7 +83,7 @@ model_path, train_losses, test_losses = train.train_seg(model.net,
                             test_data=test_images, test_labels=test_labels,
                             weight_decay=weight_decay, learning_rate=learning_rate,
                             n_epochs=n_epochs, model_name=model_name,
-                            batch_size=batch_size)
+                            batch_size=batch_size, img_transform=img_transform)
 
 
 # quick test

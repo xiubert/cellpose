@@ -314,7 +314,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
               n_epochs=100, weight_decay=0.1, normalize=True, compute_flows=False,
               save_path=None, save_every=100, save_each=False, nimg_per_epoch=None,
               nimg_test_per_epoch=None, rescale=False, scale_range=None, bsize=256,
-              min_train_masks=5, model_name=None, class_weights=None, use_bfloat16=False):
+              min_train_masks=5, model_name=None, class_weights=None, use_bfloat16=False,
+              img_transform=None):
     """
     Train the network with images for segmentation.
 
@@ -346,6 +347,12 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         rescale (bool, optional): Boolean - whether or not to rescale images during training. Defaults to False.
         min_train_masks (int, optional): Integer - minimum number of masks an image must have to use in the training set. Defaults to 5.
         model_name (str, optional): String - name of the network. Defaults to None.
+        img_transform (callable, optional): Optional callable applied to each
+            augmented TRAIN image batch (B, C, bsize, bsize) float32, right after
+            random_rotate_and_resize and before the forward pass. Must return an
+            array of the same shape and must NOT alter the labels (image-only,
+            e.g. photometric / cutout augmentation). Not applied to the test
+            batch. Defaults to None. See helpers/aug_online.py.
 
     Returns:
         tuple: A tuple containing the path to the saved model weights, training losses, and test losses.
@@ -456,6 +463,9 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             imgi, lbl = random_rotate_and_resize(imgs, Y=lbls, rescale=rsc,
                                                             scale_range=scale_range,
                                                             xy=(bsize, bsize))[:2]
+            # optional image-only augmentation (photometric / cutout); labels untouched
+            if img_transform is not None:
+                imgi = img_transform(imgi)
             # network and loss optimization
             X = torch.from_numpy(imgi).to(device)
             lbl = torch.from_numpy(lbl).to(device)
