@@ -22,13 +22,13 @@ module load cuda/12.4.1
 DATA_SRC="/ix1/$(id -gn)/cellpose"  # resolves to /ix1/<groupId>/cellpose
 mkdir -p "$SLURM_SCRATCH/train" "$SLURM_SCRATCH/test"
 if [ -z "$(ls -A "$SLURM_SCRATCH/train")" ]; then
-    echo "Copying train data to scratch..."
+    echo "Copying train data to scratch (${DATA_SRC}/train/)..."
     cp -r "$DATA_SRC/train/." "$SLURM_SCRATCH/train/"
 else
     echo "Train data already in scratch, skipping copy."
 fi
 if [ -z "$(ls -A "$SLURM_SCRATCH/test")" ]; then
-    echo "Copying test data to scratch..."
+    echo "Copying test data to scratch (${DATA_SRC}/test/)..."
     cp -r "$DATA_SRC/test/." "$SLURM_SCRATCH/test/"
 else
     echo "Test data already in scratch, skipping copy."
