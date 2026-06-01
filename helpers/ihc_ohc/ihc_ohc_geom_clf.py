@@ -79,6 +79,7 @@ import numpy as np
 import yaml
 from scipy.stats import chi2
 from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.mixture import GaussianMixture
 from sklearn.model_selection import GroupKFold
@@ -141,6 +142,25 @@ DEFAULT_CONFIG = {
                                    #   fold. False → read the deployed CNN's
                                    #   class_prob from the train segs
                                    #   (in-sample, biased — diagnostics only).
+        "threshold_grid": [round(0.30 + i * 0.02, 3) for i in range(21)],
+                                   # candidate decision thresholds for the
+                                   # *fused* score (0.30 … 0.70). Picked
+                                   # jointly with `w` on OOF for bal_acc;
+                                   # 0.5 is no longer optimal once
+                                   # probabilities are calibrated against
+                                   # the real ~1:3 prior. Component-alone
+                                   # rows stay at 0.5 for comparability.
+        "calibrate": "isotonic",   # isotonic | platt | none. Per-component
+                                   #   monotonic recalibration fit on OOF
+                                   #   train predictions, frozen, applied to
+                                   #   test. Both models train against a
+                                   #   balanced prior (sampler / class_weight)
+                                   #   so their probabilities are
+                                   #   balanced-prior calibrated, not
+                                   #   prevalence calibrated — fix that here
+                                   #   so `mean` fusion is on equal scales
+                                   #   and downstream confidences are honest.
+        "calibrate_components": ["cnn", "geom"],  # subset of {cnn, geom}
     },
     "cv": {"folds": 5, "val_frac": 0.2},
     "sweep": {},  # any model.* key → list of candidates, CV-scored
@@ -237,6 +257,70 @@ def mcnemar(y, pa, pb):
         return b, c, 0.0, 1.0
     stat = (abs(b - c) - 1) ** 2 / (b + c)
     return b, c, float(stat), float(chi2.sf(stat, 1))
+
+
+# ── probability calibration (monotonic recalibrators for late fusion) ───────────
+
+def ece(probs, y, n_bins=15):
+    """Expected calibration error — mean |bin_mean_prob − bin_accuracy|,
+    weighted by bin population. Lower is better; 0 = perfect calibration.
+
+    `probs` is P(IHC); we evaluate calibration on the predicted-class
+    confidence p* = max(p, 1−p) vs whether the argmax is correct, which is
+    the standard top-label ECE used for binary classifiers.
+    """
+    probs = np.asarray(probs, float)
+    y = np.asarray(y, int)
+    pred = (probs >= 0.5).astype(int).clip(0, 1)
+    pred = np.where(pred == 1, IHC, OHC)
+    correct = (pred == y).astype(float)
+    conf = np.maximum(probs, 1.0 - probs)
+    edges = np.linspace(0.5, 1.0, n_bins + 1)            # conf ∈ [0.5, 1]
+    edges[-1] += 1e-9
+    err = 0.0
+    n = len(y)
+    for i in range(n_bins):
+        m = (conf >= edges[i]) & (conf < edges[i + 1])
+        if m.any():
+            err += m.sum() / n * abs(conf[m].mean() - correct[m].mean())
+    return float(err)
+
+
+def fit_calibrator(probs, y, method="isotonic"):
+    """Fit a monotonic recalibrator P(IHC) → P(IHC | real prior).
+
+    `isotonic`: IsotonicRegression on (probs → label==IHC). Flexible
+    non-parametric fit; we have ~1500 IHC + ~4500 OHC OOF cells → plenty.
+    `platt`: 1-parameter logistic (LogisticRegression on the single feature
+    `probs`). For small-sample regimes — we don't need it but it's a
+    sensible fallback. `none`: identity calibrator. Returns an object with
+    a `.predict(probs)` method, so the caller never branches on method.
+    """
+    y = (np.asarray(y) == IHC).astype(int)
+    p = np.clip(np.asarray(probs, float), 1e-6, 1 - 1e-6)
+    if method == "none":
+        class _Id:
+            def predict(self, x):
+                return np.clip(np.asarray(x, float), 0.0, 1.0)
+        return _Id()
+    if method == "platt":
+        lr = LogisticRegression(C=1e6, solver="lbfgs").fit(p.reshape(-1, 1), y)
+        class _Platt:
+            def __init__(self, m):
+                self.m = m
+            def predict(self, x):
+                x = np.clip(np.asarray(x, float).reshape(-1, 1), 1e-6, 1 - 1e-6)
+                return self.m.predict_proba(x)[:, 1]
+        return _Platt(lr)
+    # isotonic (default)
+    return IsotonicRegression(out_of_bounds="clip", y_min=0.0,
+                              y_max=1.0).fit(p, y)
+
+
+def apply_calibrator(cal, probs):
+    """Transform raw probs through the recalibrator. Single-line wrapper so
+    callers don't need to know the calibrator's internal API."""
+    return np.asarray(cal.predict(np.asarray(probs, float)), float)
 
 
 # ── learned geom model ──────────────────────────────────────────────────────────
@@ -654,10 +738,30 @@ def fuse(cfg, *, run_dir=None):
     y = tr["y"]
     tlbl = "OOF train" if cnn_oof else "in-sample train, BIASED"
 
-    def report(tag, p):
-        cm = cm_from(y, np.where(p >= 0.5, IHC, OHC))
+    # Probability calibration: per-component monotonic recalibrators fit
+    # on the OOF train predictions, then frozen. Both base models train
+    # against a balanced prior, so their probabilities are balanced-prior
+    # calibrated, not prevalence calibrated → fix before fusing on a
+    # common scale. The transforms are monotonic, so argmax-accuracy is
+    # essentially preserved (the wins are in ECE and `mean`-fusion sanity).
+    cal_method = fcfg.get("calibrate", "isotonic")
+    cal_set = set(fcfg.get("calibrate_components", ["cnn", "geom"]))
+    pc_raw, pg_raw = pc.copy(), pg.copy()
+    cal_cnn = fit_calibrator(pc_raw, y,
+                             cal_method if "cnn" in cal_set else "none")
+    cal_geom = fit_calibrator(pg_raw, y,
+                              cal_method if "geom" in cal_set else "none")
+    pc = apply_calibrator(cal_cnn, pc_raw)
+    pg = apply_calibrator(cal_geom, pg_raw)
+    print(f"\ncalibration: method={cal_method}  components={sorted(cal_set)}")
+    print(f"  ECE  CNN  {ece(pc_raw, y):.4f} → {ece(pc, y):.4f}")
+    print(f"  ECE  geom {ece(pg_raw, y):.4f} → {ece(pg, y):.4f}")
+
+    def report(tag, p, th=0.5):
+        cm = cm_from(y, np.where(p >= th, IHC, OHC))
         m = metrics_from_cm(cm)
-        print(f"\n[{tag}]  acc {m['acc']:.4f}  bal_acc {m['bal_acc']:.4f}  "
+        thtag = f" @th={th:.3f}" if th != 0.5 else ""
+        print(f"\n[{tag}{thtag}]  acc {m['acc']:.4f}  bal_acc {m['bal_acc']:.4f}  "
               f"IHC_rec {m['ihc_rec']:.4f}  OHC_rec {m['ohc_rec']:.4f}  "
               f"f1 {m['macro_f1']:.4f}")
         return cm, m
@@ -666,6 +770,7 @@ def fuse(cfg, *, run_dir=None):
     report("geom alone (OOF train)", pg)
 
     fused_cfg = {}
+    th_grid = fcfg.get("threshold_grid", [0.5])
     if fcfg["method"] == "stack":
         # logreg on [p_cnn, p_geom]; OOF-stacked to avoid optimism.
         Z = np.column_stack([pc, pg])
@@ -677,24 +782,37 @@ def fuse(cfg, *, run_dir=None):
             p_fused[val] = st.predict_proba(Z[val])[:, IHC]
         st_full = LogisticRegression(class_weight=mcfg["class_weight"],
                                      max_iter=2000).fit(Z, y)
+        # threshold tuning on OOF for bal_acc (1 hyperparameter)
+        best_th, best_b = 0.5, -1.0
+        for th in th_grid:
+            b = metrics_from_cm(cm_from(
+                y, np.where(p_fused >= th, IHC, OHC)))["bal_acc"]
+            if b > best_b:
+                best_b, best_th = b, th
         fused_cfg = dict(method="stack",
                          coef=st_full.coef_[0].tolist(),
-                         intercept=float(st_full.intercept_[0]))
-    else:  # mean — pick w on the OOF grid (1 dof, coarse grid → low risk)
-        best_w, best_b = 1.0, -1.0
+                         intercept=float(st_full.intercept_[0]),
+                         threshold=best_th)
+        print(f"\nstack threshold={best_th:.3f}  OOF bal_acc {best_b:.4f}")
+    else:  # mean — joint (w, threshold) search on OOF for bal_acc
+        best_w, best_th, best_b = 0.5, 0.5, -1.0
         for w in fcfg["weight_grid"]:
-            b = metrics_from_cm(cm_from(
-                y, np.where(_fuse_mean(pc, pg, w) >= 0.5, IHC, OHC)))["bal_acc"]
-            if b > best_b:
-                best_b, best_w = b, w
+            pf = _fuse_mean(pc, pg, w)
+            for th in th_grid:
+                b = metrics_from_cm(cm_from(
+                    y, np.where(pf >= th, IHC, OHC)))["bal_acc"]
+                if b > best_b:
+                    best_b, best_w, best_th = b, w, th
         p_fused = _fuse_mean(pc, pg, best_w)
-        fused_cfg = dict(method="mean", weight=best_w)
-        print(f"\nchosen CNN weight w={best_w:.2f} "
-              f"(1-w on geom), OOF bal_acc {best_b:.4f}")
+        fused_cfg = dict(method="mean", weight=best_w, threshold=best_th)
+        print(f"\nchosen w={best_w:.2f} (CNN share)  threshold={best_th:.3f}  "
+              f"OOF bal_acc {best_b:.4f}")
+    best_th = fused_cfg["threshold"]
 
-    _, m_fused = report(f"FUSED ({fcfg['method']}, {tlbl})", p_fused)
+    _, m_fused = report(f"FUSED ({fcfg['method']}, {tlbl})", p_fused, best_th)
+    print(f"  ECE  fused {ece(p_fused, y):.4f}")
     b, c, st, pval = mcnemar(y, np.where(pc >= 0.5, IHC, OHC),
-                             np.where(p_fused >= 0.5, IHC, OHC))
+                             np.where(p_fused >= best_th, IHC, OHC))
     print(f"\nMcNemar fused-vs-CNN: CNN-only-right={b}  fused-only-right={c}  "
           f"χ²={st:.3f}  p={pval:.4g}  "
           f"→ {'significant' if pval < 0.05 else 'not significant'} "
@@ -703,7 +821,9 @@ def fuse(cfg, *, run_dir=None):
     ckpt = dict(fuse=fused_cfg, geom_source=fcfg["geom_source"],
                 model_cfg=mcfg, k_neighbors=kN, cnn_oof=cnn_oof,
                 cnn_train=m_cnn, fused_train=m_fused, mcnemar=dict(
-                    b=b, c=c, chi2=st, p=pval))
+                    b=b, c=c, chi2=st, p=pval),
+                calibrate=cal_method, calibrate_components=sorted(cal_set),
+                cal_cnn=cal_cnn, cal_geom=cal_geom)
     ckpt_path = os.path.join(run_dir, "fuse.pkl")
     with open(ckpt_path, "wb") as fh:
         pickle.dump(ckpt, fh)
@@ -719,7 +839,10 @@ def fuse(cfg, *, run_dir=None):
         else:
             gm = fit_geom(tr["feats"], tr["y"], mcfg)
             pg_t = proba_ihc(gm, te["feats"])
-        pc_t, y_t = te["p_cnn"], te["y"]
+        pc_t_raw, pg_t_raw, y_t = te["p_cnn"], pg_t, te["y"]
+        # apply the *same* calibrators fit on OOF train.
+        pc_t = apply_calibrator(cal_cnn, pc_t_raw)
+        pg_t = apply_calibrator(cal_geom, pg_t_raw)
         if fused_cfg["method"] == "stack":
             coef = np.array(fused_cfg["coef"])
             z = np.column_stack([pc_t, pg_t]) @ coef + fused_cfg["intercept"]
@@ -727,12 +850,19 @@ def fuse(cfg, *, run_dir=None):
         else:
             pf_t = _fuse_mean(pc_t, pg_t, fused_cfg["weight"])
         print(f"\n=== HELD-OUT TEST ({len(y_t)} cells) ===")
-        for tag, p in (("CNN alone", pc_t), ("geom alone", pg_t),
-                       ("FUSED", pf_t)):
-            cm = cm_from(y_t, np.where(p >= 0.5, IHC, OHC))
+        print(f"  ECE (test)  CNN  {ece(pc_t_raw, y_t):.4f} → "
+              f"{ece(pc_t, y_t):.4f}")
+        print(f"  ECE (test)  geom {ece(pg_t_raw, y_t):.4f} → "
+              f"{ece(pg_t, y_t):.4f}")
+        print(f"  ECE (test)  fused {ece(pf_t, y_t):.4f}")
+        test_th = fused_cfg.get("threshold", 0.5)
+        for tag, p, th in (("CNN alone", pc_t, 0.5),
+                            ("geom alone", pg_t, 0.5),
+                            (f"FUSED @th={test_th:.3f}", pf_t, test_th)):
+            cm = cm_from(y_t, np.where(p >= th, IHC, OHC))
             print(f"\n[{tag}]\n{fmt_cm(cm)}")
         bt, ct, stt, pt = mcnemar(y_t, np.where(pc_t >= 0.5, IHC, OHC),
-                                  np.where(pf_t >= 0.5, IHC, OHC))
+                                  np.where(pf_t >= test_th, IHC, OHC))
         print(f"\nMcNemar (test) fused-vs-CNN: CNN-only-right={bt}  "
               f"fused-only-right={ct}  χ²={stt:.3f}  p={pt:.4g}")
     return run_dir
@@ -772,14 +902,20 @@ def predict_seg_geom(geom_ckpt, seg_path, *, fuse_ckpt=None, write=False):
             print("  fusion skipped: CNN class_prob missing for some cells "
                   "(run ihc_ohc_classifier.py predict --write first)")
         else:
+            # apply the calibrators frozen at fuse-time (if the ckpt has
+            # them; older ckpts without are honoured by passing through).
+            cc, cg = fk.get("cal_cnn"), fk.get("cal_geom")
+            pc_use = apply_calibrator(cc, pc) if cc is not None else pc
+            pg_use = apply_calibrator(cg, pg) if cg is not None else pg
             f = fk["fuse"]
             if f["method"] == "stack":
-                z = (np.column_stack([pc, pg]) @ np.array(f["coef"])
+                z = (np.column_stack([pc_use, pg_use]) @ np.array(f["coef"])
                      + f["intercept"])
                 pf = 1.0 / (1.0 + np.exp(-z))
             else:
-                pf = f["weight"] * pc + (1 - f["weight"]) * pg
-            fused_map = {int(c): (CLASS_NAMES[IHC] if p >= 0.5
+                pf = f["weight"] * pc_use + (1 - f["weight"]) * pg_use
+            th = float(f.get("threshold", 0.5))  # tuned at fuse-time
+            fused_map = {int(c): (CLASS_NAMES[IHC] if p >= th
                                   else CLASS_NAMES[OHC])
                          for c, p in zip(cids, pf)}
             fused_prob = {int(c): float(max(p, 1 - p))

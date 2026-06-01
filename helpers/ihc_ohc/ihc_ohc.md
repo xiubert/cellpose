@@ -341,24 +341,37 @@ for human review; flagged regions are exactly where fusion earns its keep.
 - **`fuse`** — generates *both* train signals **out-of-fold on the same
   splits**: geom refit per fold (`oof_geom`) and the **CNN retrained per
   fold** with a nested image-level sub-val for early stopping (`oof_cnn`,
-  default `fuse.cnn_oof: true`). The fusion weight (mean) / stacker
-  (logreg) is picked on those jointly-honest OOF predictions, frozen, then
-  applied to the held-out test set — where the deployed `best.pt` is
-  rightly used (test was never seen). McNemar fused-vs-CNN. Slow by
-  design: one CNN training per fold.
+  default `fuse.cnn_oof: true`). Each OOF stream is then **monotonically
+  recalibrated** (isotonic by default) so probabilities match empirical
+  correctness at the real ~1:3 prior. The fusion weight `w` *and* the
+  fused decision threshold are picked **jointly** on OOF for bal_acc,
+  frozen, then applied to the held-out test — where the deployed
+  `best.pt` is rightly used (test was never seen). McNemar fused-vs-CNN.
+  Slow by design: one CNN training per fold.
 
 ## Result on the Cunningham held-out test set (1427 cells)
 
+Deployed pipeline: isotonic calibration on both CNN and geom, fused
+`w = 0.40` (CNN share), fused decision threshold `0.440` — both chosen
+jointly on OOF for bal_acc.
+
 | Config | acc | bal_acc | IHC rec | OHC rec | macro-F1 |
 |---|---|---|---|---|---|
-| CNN alone | 0.929 | 0.945 | 0.977 | 0.914 | 0.911 |
-| geom alone (logreg, CV 0.976 ± 0.009) | 0.963 | 0.962 | 0.960 | 0.964 | 0.951 |
-| **CNN ⊕ geom (mean, w=0.5)** | **0.980** | **0.981** | **0.983** | **0.980** | **0.974** |
+| CNN alone (calibrated) | 0.955 | 0.951 | 0.943 | 0.959 | 0.941 |
+| geom alone (logreg, CV 0.976 ± 0.009) | 0.964 | 0.961 | 0.957 | 0.966 | 0.952 |
+| **CNN ⊕ geom (mean, calibrated, tuned)** | **0.978** | **0.977** | **0.977** | **0.978** | **0.970** |
 
-Geom alone already beats the CNN; fusion lifts **every** metric with no
-trade-off. McNemar fused-vs-CNN on the test set: 78 cells fixed vs 5 lost,
-χ²=62.5, **p ≈ 3e-15** — the gain is real, not noise. The CNN's weak spot
-(OHC recall 0.914) is exactly what the geometry repairs (→ 0.980).
+Geom alone already beats the CNN; fusion lifts every metric. McNemar
+fused-vs-CNN on the test: 55 cells fixed vs 23 lost, χ² = 12.3,
+**p ≈ 4e-4** — the gain is real, not noise.
+
+For reference, the prior uncalibrated, fixed-`th=0.5` fuser hit
+bal_acc **0.981** — slightly higher, but that operating point depended on
+miscalibrated CNN over-confidence happening to align with the geom
+prediction at `w = 0.5` and `threshold = 0.5`. The deployed result (0.977)
+trades ~0.4 pp of bal_acc for genuinely honest probabilities (CNN test
+ECE **0.038 → 0.022**, ~43 % lower) and principled fusion semantics —
+see *Why calibrate?* below.
 
 **Audit / OOF-CNN validation.** An earlier version of `fuse` read the
 deployed CNN's `class_prob` straight from the train segs to pick the
@@ -366,10 +379,41 @@ fusion weight — those probs are *in-sample* (the CNN was trained on those
 cells). Switching to honest per-fold CNN retraining (`fuse.cnn_oof: true`,
 the default) drops the train-side CNN estimate from bal_acc **0.949
 (in-sample) → 0.924 (OOF)** — the ~2.5 pt of optimism the audit
-predicted. The selected weight stays **w = 0.50** even against the
-honest, weaker train signal, so the deployed pipeline and the
-held-out test (0.945 / 0.962 / **0.981**) are unchanged: the 0.98 was
-robust to the bias, not an artifact of it.
+predicted. The held-out test was unchanged by this fix because test was
+already untouched by either model; the gain is methodological soundness
+of the train-side selection, not of the headline number.
+
+## Why calibrate?
+
+Both base models train against a balanced-class objective (CNN balanced
+sampler, geom `class_weight=balanced`), so their raw probabilities are on
+a *balanced-prior* scale — not the true ~1:3 IHC:OHC prevalence. In plain
+terms: when the CNN says "0.7 chance this is IHC," that 0.7 doesn't
+correspond to 70 % empirical correctness, and averaging it with the geom's
+0.7 in `mean` fusion isn't really a 50/50 vote — whichever model is more
+overconfident dominates.
+
+**Isotonic recalibration** is a monotonic remapping from each model's raw
+probability to one that matches the empirical frequencies on data the
+model didn't see. We fit it on OOF train predictions and freeze it for
+test + inference. Three concrete things it accomplishes:
+
+1. **Honest confidences.** When `class_prob_fused` reads 0.85, it now
+   means roughly 85 % empirical correctness — useful for the GUI and any
+   downstream consumer that thresholds on confidence.
+2. **Principled `mean` fusion.** Averaging two probabilities only makes
+   sense when both are on the same scale; calibration puts them there.
+   `w = 0.5` actually means equal trust in CNN and geom.
+3. **Meaningful decision thresholds.** After calibration the bal_acc-
+   optimal cutoff is no longer accidentally at 0.5; we tune it on OOF
+   (`fuse.threshold_grid`) and freeze it for inference (`th = 0.440`).
+
+On the held-out test the CNN's ECE drops from **0.038 → 0.022** (≈ 43 %
+lower). The argmax-based metrics (bal_acc, macro-F1) move only slightly
+because the rank order of cells is preserved under monotone calibration —
+but the probabilities themselves are now interpretable. Both calibrators
+ride inside `fuse.pkl` so deployed inference applies the same monotonic
+transforms automatically.
 
 ## Model choice (sweep)
 
@@ -379,8 +423,8 @@ bal_acc — **tied within noise**, gbm ~50 % higher variance. Kept
 **logreg, C=1.0**: lower-variance, faster, and the only one with
 interpretable coefficients (which confirmed the biology). `C` is nearly
 flat for logreg; gbm ignores it (the 5 gbm rows are identical). Model
-choice barely matters anyway — fusion (0.945 → 0.981) is the real lever
-and is model-agnostic.
+choice barely matters anyway — fusion (CNN 0.951 → fused 0.977) is the
+real lever and is model-agnostic.
 
 ## Dependencies (geom-specific notes)
 
@@ -445,6 +489,9 @@ Geom classifier / fusion (`configs/geom.yaml`):
 | `model.k_neighbors` | 6 | **must match** the builder |
 | `fuse.method` | mean | `mean` (1 CV-picked weight) \| `stack` (logreg) |
 | `fuse.geom_source` | model | `model` (learned, OOF) \| `rule` (training-free) |
+| `fuse.cnn_oof` | true | retrain CNN per fold for honest train probs |
+| `fuse.calibrate` | isotonic | `isotonic` \| `platt` \| `none` — monotonic recalibrator fit on OOF |
+| `fuse.threshold_grid` | 0.30–0.70 | candidate decision thresholds for the fused score, jointly tuned with `w` on OOF |
 | `cv.folds` / `cv.val_frac` | 5 / 0.2 | GroupKFold by image |
 | `sweep.<model key>` | — | list of candidates → CV-scored grid |
 
@@ -489,10 +536,10 @@ only after they are persisted in the sidecar).
 ## Why this over early fusion
 
 Late fusion (Path A) doesn't perturb the tuned CNN recipe, validates
-independently, and already clears 0.98. Concatenating geom features into
-`TinyHCNet`'s embedding (Path B) would need a fresh sweep for a likely
-smaller marginal gain — deferred unless a single combined model is
-required for deployment.
+independently, and sits at bal_acc 0.977 with honest probabilities.
+Concatenating geom features into `TinyHCNet`'s embedding (Path B) would
+need a fresh sweep for a likely smaller marginal gain — deferred unless a
+single combined model is required for deployment.
 
 ---
 

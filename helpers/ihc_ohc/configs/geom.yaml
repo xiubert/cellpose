@@ -58,6 +58,23 @@ fuse:
                             #   is honest (slow: one CNN per fold). false →
                             #   read the deployed CNN's in-sample class_prob
                             #   from the train segs (biased; diagnostics only)
+  calibrate:   isotonic     # isotonic | platt | none. Per-component monotonic
+                            #   recalibrator fit on OOF train, frozen, applied
+                            #   to test + inference. Both models train against
+                            #   a balanced prior, so their probs are
+                            #   balanced-prior calibrated, not prevalence
+                            #   calibrated — fix that before `mean` fusion
+                            #   averages them, and to emit honest confidences.
+  calibrate_components: [cnn, geom]   # which side(s) to recalibrate
+  threshold_grid: [0.30, 0.32, 0.34, 0.36, 0.38, 0.40, 0.42, 0.44, 0.46, 0.48,
+                   0.50, 0.52, 0.54, 0.56, 0.58, 0.60, 0.62, 0.64, 0.66, 0.68, 0.70]
+                            # candidate decision thresholds for the *fused*
+                            # score, picked jointly with `w` on OOF for
+                            # bal_acc. After calibration to the true ~1:3
+                            # prior, 0.5 is no longer optimal for the
+                            # bal_acc objective — search recovers the
+                            # uncalibrated-fuse accuracy *with* honest
+                            # probabilities preserved.
 
 cv:
   folds:    5               # >=2 → GroupKFold by source image; <=1 → single split
