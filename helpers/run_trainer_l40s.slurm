@@ -40,12 +40,13 @@ export CELLPOSE_TRAIN_DIR="$SLURM_SCRATCH/train"
 export CELLPOSE_TEST_DIR="$SLURM_SCRATCH/test"
 
 # --- Dump train/test input filenames to a job-tagged log ---
-INPUT_LOG="cellpose_train_${SLURM_JOB_ID}.inputs"
+INPUT_LOG="run_logs/cellpose_train_${SLURM_JOB_ID}.inputs"
+mkdir -p run_logs
 {
-    echo "=== Train inputs ($CELLPOSE_TRAIN_DIR) ==="
+    echo "=== Train inputs (${CELLPOSE_TRAIN_DIR} via ${DATA_SRC}/train/) ==="
     ls "$CELLPOSE_TRAIN_DIR"
     echo ""
-    echo "=== Test inputs ($CELLPOSE_TEST_DIR) ==="
+    echo "=== Test inputs (${CELLPOSE_TEST_DIR} via ${DATA_SRC}/test/) ==="
     ls "$CELLPOSE_TEST_DIR"
 } > "$INPUT_LOG"
 

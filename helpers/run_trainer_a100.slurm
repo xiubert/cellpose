@@ -31,7 +31,7 @@ if [ -z "$(ls -A "$SLURM_SCRATCH/test")" ]; then
     echo "Copying test data to scratch (${DATA_SRC}/test/)..."
     cp -r "$DATA_SRC/test/." "$SLURM_SCRATCH/test/"
 else
-    echo "Test data already in scratch, skipping copy."
+    echo "Test data already in scratch, skipping copy."q
 fi
 
 # --- Point trainer at scratch directories ---
@@ -42,10 +42,10 @@ export CELLPOSE_TEST_DIR="$SLURM_SCRATCH/test"
 INPUT_LOG="run_logs/cellpose_train_${SLURM_JOB_ID}.inputs"
 mkdir -p run_logs
 {
-    echo "=== Train inputs ($CELLPOSE_TRAIN_DIR) ==="
+    echo "=== Train inputs (${CELLPOSE_TRAIN_DIR} via ${DATA_SRC}/train/) ==="
     ls "$CELLPOSE_TRAIN_DIR"
     echo ""
-    echo "=== Test inputs ($CELLPOSE_TEST_DIR) ==="
+    echo "=== Test inputs (${CELLPOSE_TEST_DIR} via ${DATA_SRC}/test/) ==="
     ls "$CELLPOSE_TEST_DIR"
 } > "$INPUT_LOG"
 
