@@ -25,9 +25,27 @@ module use ~/modulefiles
 module load cellpose_env
 module load cuda/12.4.1
 
+# --- Hyperparameter + dataset config (single source of truth; see trainer.yaml) ---
+export CELLPOSE_TRAIN_CONFIG="${CELLPOSE_TRAIN_CONFIG:-$HOME/cellpose/trainer.yaml}"
+
+# Read a key from the trainer.yaml `data:` section (PyYAML ships with cellpose_env).
+yaml_data_get() {
+    python -c "import yaml; d=(yaml.safe_load(open('$CELLPOSE_TRAIN_CONFIG')) or {}).get('data') or {}; print(d.get('$1') or '')" 2>/dev/null
+}
+
 # --- Data: copy from /ix1 project storage to fast local scratch ---
-# Data should live in /ix1/<group>/cellpose/ — NOT in $HOME (75 GB quota, not for compute data)
-DATA_SRC="/ix1/$(id -gn)/cellpose"  # resolves to /ix1/<groupId>/cellpose
+# The dataset dir (must contain train/ and test/ with paired .tif + _seg.npy)
+# comes from trainer.yaml `data.source`, so the dataset is part of the frozen,
+# reproducible run config — not hardcoded here. CELLPOSE_DATA_SRC overrides;
+# final fallback is the PMID-38653806 / Cunningham label-transfer set.
+DATA_SRC="${CELLPOSE_DATA_SRC:-$(yaml_data_get source)}"
+DATA_SRC="${DATA_SRC:-/ix1/$(id -gn)/cellpose/data/PMID_38653806/Cunningham}"
+# Trained models are copied back here, kept out of the data dir. From
+# trainer.yaml `data.model_dst`, else CELLPOSE_MODEL_DST, else the canonical dir.
+MODEL_DST="${CELLPOSE_MODEL_DST:-$(yaml_data_get model_dst)}"
+MODEL_DST="${MODEL_DST:-/ix1/$(id -gn)/cellpose/models}"
+echo "DATA_SRC=$DATA_SRC"
+echo "MODEL_DST=$MODEL_DST"
 mkdir -p "$SLURM_SCRATCH/train" "$SLURM_SCRATCH/test"
 if [ -z "$(ls -A "$SLURM_SCRATCH/train")" ]; then
     echo "Copying train data to scratch (${DATA_SRC}/train/)..."
@@ -39,15 +57,12 @@ if [ -z "$(ls -A "$SLURM_SCRATCH/test")" ]; then
     echo "Copying test data to scratch (${DATA_SRC}/test/)..."
     cp -r "$DATA_SRC/test/." "$SLURM_SCRATCH/test/"
 else
-    echo "Test data already in scratch, skipping copy."q
+    echo "Test data already in scratch, skipping copy."
 fi
 
 # --- Point trainer at scratch directories ---
 export CELLPOSE_TRAIN_DIR="$SLURM_SCRATCH/train"
 export CELLPOSE_TEST_DIR="$SLURM_SCRATCH/test"
-
-# --- Hyperparameter config (single source of truth; see trainer.yaml) ---
-export CELLPOSE_TRAIN_CONFIG="${CELLPOSE_TRAIN_CONFIG:-$HOME/cellpose/trainer.yaml}"
 
 # --- Dump train/test input filenames + freeze the config to job-tagged logs ---
 INPUT_LOG="run_logs/cellpose_train_${SLURM_JOB_ID}.inputs"
@@ -64,9 +79,9 @@ cp "$CELLPOSE_TRAIN_CONFIG" "run_logs/cellpose_train_${SLURM_JOB_ID}.config.yaml
 
 # --- Trap: copy model output back to project storage on exit (success or failure) ---
 run_on_exit() {
-    echo "Copying models back to project storage..."
-    mkdir -p "$DATA_SRC/models"
-    cp -r "$HOME/cellpose/models/." "$DATA_SRC/models/" 2>/dev/null || true
+    echo "Copying models back to project storage ($MODEL_DST)..."
+    mkdir -p "$MODEL_DST"
+    cp -r "$HOME/cellpose/models/." "$MODEL_DST/" 2>/dev/null || true
 }
 trap run_on_exit EXIT
 
