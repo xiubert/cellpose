@@ -1,0 +1,23 @@
+# Cellpose-SAM fine-tune hyperparameters — single source of truth for a
+# SLURM training run. Read by trainer_slurm.py.
+#
+# Override the path with CELLPOSE_TRAIN_CONFIG (run_trainer.slurm sets it to
+# $HOME/cellpose/trainer.yaml by default). The job freezes a copy of the
+# resolved values into the run log, and run_trainer.slurm also copies this
+# file to run_logs/cellpose_train_<jobid>.config.yaml.
+#
+# Anything omitted falls back to the built-in defaults in trainer_slurm.py.
+# Unknown keys are warned about and ignored (typo guard).
+
+train:
+  weight_decay:  0.1
+  learning_rate: 1.0e-5
+  n_epochs:      95
+  batch_size:    8         # was 1 on local 8 GB GPU; 8 fits an A100 40 GB
+  model_name:    label_xfer_aug_retest
+
+# Refining an already-adapted model on a small target dataset:
+#   weight_decay:  0.05    # or 0.1 if overfitting appears
+#   learning_rate: 1.0e-6
+#   n_epochs:      40
+#   batch_size:    8

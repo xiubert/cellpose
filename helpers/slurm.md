@@ -83,20 +83,37 @@ Then edit `run_trainer.slurm` and set `DATA_SRC="/ix1/<group>/cellpose"`.
 ### 1. Upload scripts to cluster
 ```bash
 sftp [username]@h2p.crc.pitt.edu
-put cellpose_git/helpers/trainer.py ~/cellpose/helpers/trainer.py
-put cellpose_git/helpers/run_trainer.slurm ~/cellpose/helpers/run_trainer.slurm
+put cellpose_git/helpers/trainer_slurm.py  ~/cellpose/trainer_slurm.py
+put cellpose_git/helpers/trainer.yaml      ~/cellpose/trainer.yaml
+put cellpose_git/helpers/run_trainer.slurm ~/cellpose/run_trainer.slurm
+put cellpose_git/helpers/submit.sh         ~/cellpose/submit.sh
+put cellpose_git/helpers/.env.example      ~/cellpose/.env.example
 ```
 
-### 2. Before submitting: edit run_trainer.slurm
-Two placeholders to fill in:
-```
-DATA_SRC="/ix1/<group>/cellpose"
-#SBATCH --mail-user=[your_pitt_email]@pitt.edu
-```
+### 2. Before submitting
+
+- **Email** (`.env`, gitignored — never committed):
+  ```bash
+  cp ~/cellpose/.env.example ~/cellpose/.env
+  # edit ~/cellpose/.env:  PITT_EMAIL=your_pitt_id@pitt.edu
+  ```
+  `submit.sh` sources `.env` and passes `--mail-user` to `sbatch`. (SBATCH
+  directives are parsed at submit time and can't read shell vars, so the
+  address has to come in on the command line.)
+
+- **Data path**: set `DATA_SRC="/ix1/<group>/cellpose"` in `run_trainer.slurm`.
+
+- **Hyperparameters** (`trainer.yaml`): `weight_decay`, `learning_rate`,
+  `n_epochs`, `batch_size`, `model_name`. Edit the YAML rather than the
+  Python — it's the single source of truth and the trainer logs the
+  resolved values into the `.out`. Override its location with
+  `CELLPOSE_TRAIN_CONFIG`; `run_trainer.slurm` also freezes a copy to
+  `run_logs/cellpose_train_<jobid>.config.yaml`.
 
 ### 3. Submit the job
 ```bash
-sbatch ~/cellpose/run_trainer.slurm
+./submit.sh                       # sources .env, runs sbatch
+# (any extra args are forwarded to sbatch)
 ```
 
 ### 4. Model output
@@ -172,3 +189,6 @@ Scratch is automatically cleaned up when the job exits. The EXIT trap in the SLU
 | PyTorch | Must install with `--index-url https://download.pytorch.org/whl/cu124` — default pip install pulls cu130 which is unavailable on CRC |
 | CUDA module | `cuda/12.4.1` matches `torch+cu124`; cluster max is `cuda/12.9.0` |
 | Add trained model | `python -m cellpose --add_model "/path/to/model"` |
+| Hyperparameters | `trainer.yaml` (single source of truth); override path with `CELLPOSE_TRAIN_CONFIG`; resolved values logged + frozen to `run_logs/*.config.yaml` |
+| Email | `PITT_EMAIL` in `.env` (gitignored), passed by `submit.sh` → `sbatch --mail-user` |
+| PyYAML | `trainer_slurm.py` imports `yaml`; `pip install pyyaml` into the cellpose env if missing |

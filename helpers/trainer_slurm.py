@@ -1,6 +1,8 @@
 import logging
 import os
 from datetime import datetime
+
+import yaml
 from cellpose import io, models, train
 
 slurm_job_id = os.environ.get("SLURM_JOB_ID")
@@ -25,17 +27,37 @@ logger.info("test  images (%d): %s", len(image_names_test or []), image_names_te
 
 model = models.CellposeModel(gpu=True)
 
-weight_decay = 0.1
-learning_rate = 1e-5
-n_epochs = 95
-model_name = "label_xfer_aug_retest"
-batch_size = 8
+# --- Hyperparameters from YAML (single source of truth; see trainer.yaml) ---
+DEFAULTS = {
+    "weight_decay": 0.1,
+    "learning_rate": 1e-5,
+    "n_epochs": 95,
+    "batch_size": 8,
+    "model_name": "label_xfer_aug_retest",
+}
 
-# Refining an already-adapted model on a small target dataset
-# weight_decay=0.05  # or 0.1 if overfitting appears
-# learning_rate=1e-6
-# n_epochs=30-50
-# batch_size=8
+config_path = os.environ.get(
+    "CELLPOSE_TRAIN_CONFIG",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "trainer.yaml"),
+)
+
+cfg = dict(DEFAULTS)
+if os.path.exists(config_path):
+    with open(config_path) as f:
+        loaded = (yaml.safe_load(f) or {}).get("train") or {}
+    unknown = set(loaded) - set(DEFAULTS)
+    if unknown:
+        logger.warning("ignoring unknown train config keys: %s", sorted(unknown))
+    cfg.update({k: v for k, v in loaded.items() if k in DEFAULTS})
+    logger.info("loaded train config: %s", config_path)
+else:
+    logger.warning("config %s not found — using built-in defaults", config_path)
+
+weight_decay = cfg["weight_decay"]
+learning_rate = cfg["learning_rate"]
+n_epochs = cfg["n_epochs"]
+model_name = cfg["model_name"]
+batch_size = cfg["batch_size"]
 
 logger.info(
     "train params: weight_decay=%s  learning_rate=%s  n_epochs=%s  "

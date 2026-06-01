@@ -10,7 +10,8 @@
 #SBATCH --output=run_logs/cellpose_train_%j.out
 #SBATCH --error=run_logs/cellpose_train_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
-#SBATCH --mail-user=[your_pitt_email]@pitt.edu
+# --mail-user is supplied at submit time by submit.sh (from .env / PITT_EMAIL);
+# submit with:  ./submit.sh   (not: sbatch run_trainer.slurm)
 
 # for L40S, we use fewer resources (4 CPUs, 32 GB RAM) than for A100, since the GPU is more powerful and can handle the training load without needing as much CPU/RAM support. Adjust these values if you find that the job is running out of memory or if you want to speed up data loading.
 # --partition=l40s
@@ -45,9 +46,14 @@ fi
 export CELLPOSE_TRAIN_DIR="$SLURM_SCRATCH/train"
 export CELLPOSE_TEST_DIR="$SLURM_SCRATCH/test"
 
-# --- Dump train/test input filenames to a job-tagged log ---
+# --- Hyperparameter config (single source of truth; see trainer.yaml) ---
+export CELLPOSE_TRAIN_CONFIG="${CELLPOSE_TRAIN_CONFIG:-$HOME/cellpose/trainer.yaml}"
+
+# --- Dump train/test input filenames + freeze the config to job-tagged logs ---
 INPUT_LOG="run_logs/cellpose_train_${SLURM_JOB_ID}.inputs"
 mkdir -p run_logs
+cp "$CELLPOSE_TRAIN_CONFIG" "run_logs/cellpose_train_${SLURM_JOB_ID}.config.yaml" 2>/dev/null \
+    || echo "warning: config $CELLPOSE_TRAIN_CONFIG not found; trainer will use built-in defaults"
 {
     echo "=== Train inputs (${CELLPOSE_TRAIN_DIR} via ${DATA_SRC}/train/) ==="
     ls "$CELLPOSE_TRAIN_DIR"
