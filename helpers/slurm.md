@@ -25,6 +25,7 @@ The default `pip install cellpose` pulls PyTorch built for CUDA 13.0 which is no
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 pip install cellpose
+pip install yaml
 ```
 
 Verify the right build is installed:
@@ -83,11 +84,11 @@ Then edit `run_trainer.slurm` and set `DATA_SRC="/ix1/<group>/cellpose"`.
 ### 1. Upload scripts to cluster
 ```bash
 sftp [username]@h2p.crc.pitt.edu
-put cellpose_git/helpers/trainer_slurm.py  ~/cellpose/trainer_slurm.py
-put cellpose_git/helpers/trainer.yaml      ~/cellpose/trainer.yaml
-put cellpose_git/helpers/run_trainer.slurm ~/cellpose/run_trainer.slurm
-put cellpose_git/helpers/submit.sh         ~/cellpose/submit.sh
-put cellpose_git/helpers/.env.example      ~/cellpose/.env.example
+put cellpose_git/helpers/trainer_slurm.py  cellpose/trainer_slurm.py
+put cellpose_git/helpers/trainer.yaml      cellpose/trainer.yaml
+put cellpose_git/helpers/run_trainer.slurm cellpose/run_trainer.slurm
+put cellpose_git/helpers/submit.sh         cellpose/submit.sh
+put cellpose_git/helpers/.env.example      cellpose/.env.example
 ```
 
 ### 2. Before submitting
