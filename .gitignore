@@ -141,3 +141,5 @@ backup/
 # fuse.pkl, history.json, *_results.json, *_preview.png, …). Code, configs,
 # and docs in helpers/ihc_ohc/ stay tracked.
 helpers/ihc_ohc/runs/
+
+helpers/log/

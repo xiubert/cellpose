@@ -19,11 +19,13 @@ data:
   model_dst: /ix1/pcody/cellpose/models
 
 train:
-  weight_decay:  0.1
-  learning_rate: 1.0e-5
-  n_epochs:      95
-  batch_size:    8         # was 1 on local 8 GB GPU; 8 fits an A100 40 GB
-  model_name:    label_xfer_online_aug   # online-aug rerun of label_xfer_aug_retest (don't overwrite the old best)
+  weight_decay:   0.1
+  learning_rate:  1.0e-5
+  n_epochs:       95
+  batch_size:     8         # was 1 on local 8 GB GPU; 8 fits an A100 40 GB
+  nimg_per_epoch: 750       # match the old offline-aug crop budget (93×8≈744);
+                            # default (=#train files=93) gave 8× fewer steps/epoch
+  model_name:     label_xfer_online_aug_nimg750  # budget-matched online-aug rerun
 
 # Refining an already-adapted model on a small target dataset:
 #   weight_decay:  0.05    # or 0.1 if overfitting appears

@@ -39,6 +39,7 @@ DEFAULTS = {
     "n_epochs": 95,
     "batch_size": 8,
     "model_name": "label_xfer_aug_retest",
+    "nimg_per_epoch": None,   # crops sampled per epoch; None -> #train files
 }
 
 config_path = os.environ.get(
@@ -70,11 +71,12 @@ learning_rate = cfg["learning_rate"]
 n_epochs = cfg["n_epochs"]
 model_name = cfg["model_name"]
 batch_size = cfg["batch_size"]
+nimg_per_epoch = cfg["nimg_per_epoch"]
 
 logger.info(
     "train params: weight_decay=%s  learning_rate=%s  n_epochs=%s  "
-    "model_name=%s  batch_size=%s",
-    weight_decay, learning_rate, n_epochs, model_name, batch_size,
+    "model_name=%s  batch_size=%s  nimg_per_epoch=%s",
+    weight_decay, learning_rate, n_epochs, model_name, batch_size, nimg_per_epoch,
 )
 
 
@@ -83,6 +85,7 @@ model_path, train_losses, test_losses = train.train_seg(model.net,
                             test_data=test_images, test_labels=test_labels,
                             weight_decay=weight_decay, learning_rate=learning_rate,
                             n_epochs=n_epochs, model_name=model_name,
+                            nimg_per_epoch=nimg_per_epoch,
                             batch_size=batch_size, img_transform=img_transform)
 
 
