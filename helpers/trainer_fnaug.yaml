@@ -1,0 +1,32 @@
+# FN-focused augmentation config — experiment 1.
+#
+# Failure mode (from the curation error-eval + threshold sweep): the model
+# UNDER-SEGMENTS / MERGES densely-packed large elongated OHCs (false negatives).
+# Hypothesis: the occlusion/softening augmentations oppose cell DETECTION and,
+# on the now-ample 67-image set, over-regularize against FN. So drop them:
+#   - cutout      occludes cells -> teaches tolerance for missing them
+#   - gauss_blur  softens boundaries -> worse separation of touching cells +
+#                 worse detection of faint cells
+# Keep intensity + light noise (do not oppose detection). Everything else
+# identical to the from-cpsam baseline (lr 1e-5, wd 0.1, 95 ep, nimg 750), so
+# the only change vs the 71.9%-FN-recovery model is the augmentation CONTENT.
+#
+# Compare FN-recovery (clc_error_eval.py) vs the baseline 71.9% on CLC_full.
+
+data:
+  source:    /ix1/pcody/cellpose/data/CLC_full   # ignored under CV (CELLPOSE_TRAIN_DIR overrides)
+  model_dst: /ix1/pcody/cellpose/models
+
+train:
+  weight_decay:   0.1
+  learning_rate:  1.0e-5
+  n_epochs:       95
+  batch_size:     8
+  nimg_per_epoch: 750
+  model_name:     clc_all_fnaug   # overridden per fold by CELLPOSE_MODEL_NAME
+
+augment:
+  seed: 0
+  intensity:   {p: 0.5, scale: [0.75, 1.25], gamma: [0.8, 1.25]}
+  gauss_noise: {p: 0.3, sigma_frac: 0.05}
+  # cutout + gauss_blur intentionally removed (oppose detection -> FN).
