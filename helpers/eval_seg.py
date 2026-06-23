@@ -58,18 +58,23 @@ def load_pair(seg_path):
     return img, gt
 
 
+_BUILTINS = {"cpsam"}
+
+
 def resolve_model(entry, models_dir):
     if os.path.exists(entry):
         return entry
     cand = os.path.join(models_dir, entry)
     if os.path.exists(cand):
         return cand
+    if entry in _BUILTINS:
+        return entry  # let CellposeModel resolve the built-in weights
     raise FileNotFoundError(f"model not found: {entry} (also tried {cand})")
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Head-to-head Cellpose-SAM segmentation eval (AP@IoU)")
-    p.add_argument("--test_dir", required=True)
+    p.add_argument("--test_dir", required=True, help="test dir, or comma-separated dirs (e.g. CLC adult,neonate)")
     p.add_argument("--models", required=True, help="comma-separated model names/paths")
     p.add_argument("--models_dir", default="/ix1/pcody/cellpose/models")
     p.add_argument("--thresholds", default="0.5,0.75,0.9")
@@ -84,17 +89,19 @@ def main():
     thresholds = [float(t) for t in args.thresholds.split(",")]
     model_entries = [m.strip() for m in args.models.split(",") if m.strip()]
 
-    seg_paths = iter_test_segs(args.test_dir)
+    test_dirs = [d.strip() for d in args.test_dir.split(",") if d.strip()]
+    seg_paths = [p for d in test_dirs for p in iter_test_segs(d)]
     if not seg_paths:
-        raise SystemExit(f"no (non-augmented) *_seg.npy in {args.test_dir}")
-    print(f"test images: {len(seg_paths)}  thresholds: {thresholds}\n", flush=True)
+        raise SystemExit(f"no (non-augmented) *_seg.npy in {test_dirs}")
+    print(f"test images: {len(seg_paths)}  (dirs: {len(test_dirs)})  thresholds: {thresholds}\n", flush=True)
 
-    images, gts, names = [], [], []
+    images, gts, names, srcs = [], [], [], []
     for sp in seg_paths:
         img, gt = load_pair(sp)
         images.append(img)
         gts.append(gt)
         names.append(_seg_stem(sp))
+        srcs.append(os.path.basename(os.path.dirname(sp)))
     n_true = np.array([len(np.unique(g)) - 1 for g in gts])
 
     channel_axis = 2 if images[0].ndim == 3 else None
@@ -111,7 +118,7 @@ def main():
         ap, tp, fp, fn = average_precision(gts, masks_pred, threshold=thresholds)
         n_pred = np.array([len(np.unique(m)) - 1 for m in masks_pred])
         for i, nm in enumerate(names):
-            rows.append([name, nm, int(n_true[i]), int(n_pred[i])] + [float(ap[i, k]) for k in range(len(thresholds))])
+            rows.append([name, srcs[i], nm, int(n_true[i]), int(n_pred[i])] + [float(ap[i, k]) for k in range(len(thresholds))])
         mAP = ap.mean(axis=0)
         summary.append([name] + [float(v) for v in mAP] + [float(n_pred.mean())])
         thstr = "  ".join(f"AP@{t}={mAP[k]:.4f}" for k, t in enumerate(thresholds))
@@ -131,7 +138,7 @@ def main():
         import csv
         with open(args.out, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["model", "image", "n_true", "n_pred"] + [f"AP@{t}" for t in thresholds])
+            w.writerow(["model", "source", "image", "n_true", "n_pred"] + [f"AP@{t}" for t in thresholds])
             w.writerows(rows)
         print(f"\nwrote per-image results: {args.out}")
 
