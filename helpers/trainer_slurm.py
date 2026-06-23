@@ -48,6 +48,7 @@ DEFAULTS = {
     "batch_size": 8,
     "model_name": "label_xfer_aug_retest",
     "nimg_per_epoch": None,   # crops sampled per epoch; None -> #train files
+    "boundary_weight": 0.0,   # separation-aware boundary loss alpha; 0 = stock
 }
 
 config_path = os.environ.get(
@@ -81,11 +82,13 @@ n_epochs = cfg["n_epochs"]
 model_name = os.environ.get("CELLPOSE_MODEL_NAME") or cfg["model_name"]
 batch_size = cfg["batch_size"]
 nimg_per_epoch = cfg["nimg_per_epoch"]
+boundary_weight = cfg["boundary_weight"]
 
 logger.info(
     "train params: weight_decay=%s  learning_rate=%s  n_epochs=%s  "
-    "model_name=%s  batch_size=%s  nimg_per_epoch=%s",
+    "model_name=%s  batch_size=%s  nimg_per_epoch=%s  boundary_weight=%s",
     weight_decay, learning_rate, n_epochs, model_name, batch_size, nimg_per_epoch,
+    boundary_weight,
 )
 
 
@@ -95,7 +98,8 @@ model_path, train_losses, test_losses = train.train_seg(model.net,
                             weight_decay=weight_decay, learning_rate=learning_rate,
                             n_epochs=n_epochs, model_name=model_name,
                             nimg_per_epoch=nimg_per_epoch,
-                            batch_size=batch_size, img_transform=img_transform)
+                            batch_size=batch_size, img_transform=img_transform,
+                            boundary_weight=boundary_weight)
 
 
 # quick test

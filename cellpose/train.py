@@ -30,7 +30,7 @@ def _loss_fn_class(lbl, y, class_weights=None):
     
     return loss3
 
-def _loss_fn_seg(lbl, y, device):
+def _loss_fn_seg(lbl, y, device, boundary_weight=0.0):
     """
     Calculates the loss function between true labels lbl and prediction y.
 
@@ -38,19 +38,41 @@ def _loss_fn_seg(lbl, y, device):
         lbl (numpy.ndarray): True labels (cellprob, flowsY, flowsX).
         y (torch.Tensor): Predicted values (flowsY, flowsX, cellprob).
         device (torch.device): Device on which the tensors are located.
+        boundary_weight (float): Separation-aware boundary weighting (alpha). 0 =
+            stock uniform loss (default, exact baseline). >0 upweights pixels at
+            cell-cell boundaries — where the TARGET flow field has a large spatial
+            gradient (flows flip from pointing to one center to the neighbour's),
+            i.e. the touching edges where cellpose under-segments / merges. The
+            weighted terms are normalized by the weight sum so the overall loss
+            magnitude is unchanged (alpha only redistributes emphasis, it is NOT
+            a loss-scale / LR multiplier). See helpers/notes/progress.md.
 
     Returns:
         torch.Tensor: Loss value.
 
     """
-    criterion = nn.MSELoss(reduction="mean")
-    criterion2 = nn.BCEWithLogitsLoss(reduction="mean")
     veci = 5. * lbl[:, -2:]
-    loss = criterion(y[:, -3:-1], veci)
-    loss /= 2.
-    loss2 = criterion2(y[:, -1], (lbl[:, -3] > 0.5).to(y.dtype))
-    loss = loss + loss2
-    return loss
+    fg = (lbl[:, -3] > 0.5).to(y.dtype)
+    if not boundary_weight:
+        loss = nn.MSELoss(reduction="mean")(y[:, -3:-1], veci) / 2.
+        loss = loss + nn.BCEWithLogitsLoss(reduction="mean")(y[:, -1], fg)
+        return loss
+
+    # per-pixel boundary weight from the spatial gradient of the target flows
+    flo = lbl[:, -2:]                                            # (B,2,H,W)
+    gy = torch.nn.functional.pad(flo[:, :, 1:, :] - flo[:, :, :-1, :], (0, 0, 0, 1))
+    gx = torch.nn.functional.pad(flo[:, :, :, 1:] - flo[:, :, :, :-1], (0, 1, 0, 0))
+    g = torch.sqrt((gy ** 2).sum(1) + (gx ** 2).sum(1) + 1e-8)  # (B,H,W)
+    gmax = g.flatten(1).amax(1).clamp(min=1e-6).view(-1, 1, 1)
+    w = 1.0 + float(boundary_weight) * (g / gmax)               # (B,H,W), >=1
+    wf = w.unsqueeze(1)                                         # (B,1,H,W)
+
+    err = (y[:, -3:-1] - veci) ** 2                             # (B,2,H,W)
+    mse = (err * wf).sum() / (wf.sum() * err.shape[1])          # weight-normalized
+    bce_px = torch.nn.functional.binary_cross_entropy_with_logits(
+        y[:, -1], fg, reduction="none")                        # (B,H,W)
+    bce = (bce_px * w).sum() / w.sum()
+    return mse / 2. + bce
 
 def _reshape_norm(data, channel_axis=None, normalize_params={"normalize": False}):
     """
@@ -315,7 +337,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
               save_path=None, save_every=100, save_each=False, nimg_per_epoch=None,
               nimg_test_per_epoch=None, rescale=False, scale_range=None, bsize=256,
               min_train_masks=5, model_name=None, class_weights=None, use_bfloat16=False,
-              img_transform=None):
+              img_transform=None, boundary_weight=0.0):
     """
     Train the network with images for segmentation.
 
@@ -472,7 +494,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
 
             with torch.autocast(device_type=device.type, dtype=net.dtype):
                 y = net(X)[0]
-                loss = _loss_fn_seg(lbl, y, device)
+                loss = _loss_fn_seg(lbl, y, device, boundary_weight=boundary_weight)
                 if y.shape[1] > 3:
                     loss3 = _loss_fn_class(lbl, y, class_weights=class_weights)
                     loss += loss3

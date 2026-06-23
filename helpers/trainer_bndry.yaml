@@ -1,0 +1,31 @@
+# Separation-aware boundary-loss config — attacks the dense-cell MERGING that
+# causes the residual ~28% FN (under-segmentation of touching elongated OHCs).
+#
+# Identical to the clc_all_full baseline (lr 1e-5, wd 0.1, 95 ep, nimg 750, full
+# online aug) EXCEPT train.boundary_weight > 0, so the loss is the only variable.
+# boundary_weight (alpha) upweights pixels where the target flow field has a large
+# spatial gradient (= cell-cell separating edges); normalized by weight sum so it
+# only redistributes loss emphasis, not the overall scale (no LR confound).
+# alpha=0 reproduces the baseline exactly. Start at 5; sweep {3,6,10} only if 5
+# shows signal. WATCH: over-splitting shows up as rising FP / falling TP-retention,
+# not better FN-recovery (clc_error_eval.py).
+
+data:
+  source:    /ix1/pcody/cellpose/data/CLC_full   # ignored under CV (CELLPOSE_TRAIN_DIR overrides)
+  model_dst: /ix1/pcody/cellpose/models
+
+train:
+  weight_decay:    0.1
+  learning_rate:   1.0e-5
+  n_epochs:        95
+  batch_size:      8
+  nimg_per_epoch:  750
+  boundary_weight: 5.0            # separation-aware loss alpha (0 = stock)
+  model_name:      clc_all_bndry  # overridden per fold by CELLPOSE_MODEL_NAME
+
+augment:
+  seed: 0
+  intensity:   {p: 0.5, scale: [0.75, 1.25], gamma: [0.8, 1.25]}
+  cutout:      {p: 0.5, n: [1, 3], size_frac: [0.05, 0.15], fill: mean}
+  gauss_noise: {p: 0.3, sigma_frac: 0.05}
+  gauss_blur:  {p: 0.2, sigma: [0.5, 1.5]}
