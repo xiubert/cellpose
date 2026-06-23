@@ -30,7 +30,15 @@ images, labels, image_names, test_images, test_labels, image_names_test = output
 logger.info("train images (%d): %s", len(image_names), image_names)
 logger.info("test  images (%d): %s", len(image_names_test or []), image_names_test)
 
-model = models.CellposeModel(gpu=True)
+# Warm-start: init from an existing model instead of stock cpsam.
+# From env CELLPOSE_PRETRAINED (a model path) — used by the CV loop for the
+# "refine label_xfer_aug_retest on CLC" recipe. Default: stock cpsam.
+pretrained = os.environ.get("CELLPOSE_PRETRAINED")
+if pretrained:
+    logger.info("warm-start: init from pretrained_model=%s", pretrained)
+    model = models.CellposeModel(gpu=True, pretrained_model=pretrained)
+else:
+    model = models.CellposeModel(gpu=True)
 
 # --- Hyperparameters from YAML (single source of truth; see trainer.yaml) ---
 DEFAULTS = {
@@ -69,7 +77,8 @@ logger.info("augment config: %s", augment_cfg or "(none — img_transform disabl
 weight_decay = cfg["weight_decay"]
 learning_rate = cfg["learning_rate"]
 n_epochs = cfg["n_epochs"]
-model_name = cfg["model_name"]
+# CELLPOSE_MODEL_NAME overrides the YAML model_name (CV loop sets it per fold).
+model_name = os.environ.get("CELLPOSE_MODEL_NAME") or cfg["model_name"]
 batch_size = cfg["batch_size"]
 nimg_per_epoch = cfg["nimg_per_epoch"]
 
