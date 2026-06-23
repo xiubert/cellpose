@@ -58,7 +58,7 @@ def load_pair(seg_path):
     return img, gt
 
 
-_BUILTINS = {"cpsam"}
+_BUILTINS = {"cpsam", "cpsam_v2", "cpdino", "cpdino-vitb"}
 
 
 def resolve_model(entry, models_dir):

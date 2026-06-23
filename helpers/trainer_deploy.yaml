@@ -1,0 +1,31 @@
+# Final DEPLOYABLE model config — train the winning recipe (clc_all from cpsam)
+# on ALL 67 CLC images, no held-out fold. This produces the production model;
+# its expected performance is the CV estimate already measured
+# (clc_all_full_20260604: FN-recovery 72%, FP-suppression 90%, AP@0.5 0.82).
+#
+# Identical recipe/config to the clc_all_full CV folds (lr 1e-5, wd 0.1, 95 ep,
+# nimg 750, full online aug, from stock cpsam) — only the data is all 67 images.
+# data.source points at CLC_full_deploy/ (train/ = all 67; test/ = same 67, used
+# only for in-sample loss monitoring — a deploy model holds out nothing).
+#
+# Run:  sbatch --export=ALL,CELLPOSE_TRAIN_CONFIG=$HOME/cellpose/trainer_deploy.yaml run_trainer.slurm
+
+data:
+  source:    /ix1/pcody/cellpose/data/CLC_full_deploy
+  model_dst: /ix1/pcody/cellpose/models
+
+train:
+  weight_decay:    0.1
+  learning_rate:   1.0e-5
+  n_epochs:        95
+  batch_size:      8
+  nimg_per_epoch:  750
+  boundary_weight: 0.0                  # boundary loss was a dead end; stock loss
+  model_name:      clc_all_full_deploy
+
+augment:
+  seed: 0
+  intensity:   {p: 0.5, scale: [0.75, 1.25], gamma: [0.8, 1.25]}
+  cutout:      {p: 0.5, n: [1, 3], size_frac: [0.05, 0.15], fill: mean}
+  gauss_noise: {p: 0.3, sigma_frac: 0.05}
+  gauss_blur:  {p: 0.2, sigma: [0.5, 1.5]}
