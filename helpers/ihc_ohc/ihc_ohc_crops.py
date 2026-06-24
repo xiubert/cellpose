@@ -142,6 +142,7 @@ def tif_for_seg(seg_path):
 PRED_KEYS = ("class_map_pred", "class_prob",
              "class_map_geom", "class_prob_geom", "geom_flag",
              "class_map_fused", "class_prob_fused",
+             "row_override",
              "class_map_user")
 
 

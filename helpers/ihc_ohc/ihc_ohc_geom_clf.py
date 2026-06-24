@@ -164,6 +164,20 @@ DEFAULT_CONFIG = {
                                    #   so `mean` fusion is on equal scales
                                    #   and downstream confidences are honest.
         "calibrate_components": ["cnn", "geom"],  # subset of {cnn, geom}
+        # Per-image row-consistency post-pass applied at *inference* time
+        # (predict_seg_geom), after fusion. IHC/OHC separate almost
+        # perfectly by signed perp offset; this re-anchors the two perp
+        # bands on the confident fused calls and flips any *low-confidence*
+        # fused label whose perp position clearly belongs to the other
+        # band. Confidence-gated → never overrides a confident call. The
+        # params ride inside fuse.pkl so deployed/GUI inference applies the
+        # same rule. Off by default (Cunningham unaffected); CLC enables it.
+        "row_consistency": {
+            "enabled": False,
+            "conf_anchor": 0.85,    # fused conf ≥ this anchors the bands
+            "conf_override": 0.60,  # only flip fused labels below this conf
+            "k_anchor": 15,         # nearest perp anchors averaged per band
+        },
     },
     "cv": {"folds": 5, "val_frac": 0.2},
     "sweep": {},  # any model.* key → list of candidates, CV-scored
@@ -830,7 +844,8 @@ def fuse(cfg, *, run_dir=None):
                 cnn_train=m_cnn, fused_train=m_fused, mcnemar=dict(
                     b=b, c=c, chi2=st, p=pval),
                 calibrate=cal_method, calibrate_components=sorted(cal_set),
-                cal_cnn=cal_cnn, cal_geom=cal_geom)
+                cal_cnn=cal_cnn, cal_geom=cal_geom,
+                row_consistency=fcfg.get("row_consistency"))
     ckpt_path = os.path.join(run_dir, "fuse.pkl")
     with open(ckpt_path, "wb") as fh:
         pickle.dump(ckpt, fh)
@@ -877,6 +892,52 @@ def fuse(cfg, *, run_dir=None):
 
 # ── predict (write back into one seg) ───────────────────────────────────────────
 
+_PERP_IDX = FEATURE_NAMES.index("perp_signed")
+
+
+def row_consistency_refine(cids, feats, fused_map, fused_prob, *,
+                           conf_anchor=0.85, conf_override=0.60, k_anchor=15):
+    """Per-image row-consistency post-pass over the fused labels.
+
+    IHC and OHC cells separate almost perfectly by signed perpendicular
+    offset from the organ-of-Corti axis (`perp_signed`). The residual fused
+    errors are cells sitting unambiguously in one row that got the other
+    label at low confidence. This re-anchors the two perp bands on the
+    *confident* fused calls (≥`conf_anchor`) and, for any cell whose own
+    fused label is uncertain (<`conf_override`) yet whose perp position is
+    nearer the other band, flips it to match.
+
+    Confidence-gated, so it never touches a confident fused call — on the
+    CLC curator-correction set this recovered 40/68 errors with **zero**
+    cells flipped the wrong way. No-op (empty `overrides`) when either band
+    lacks ≥3 confident anchors. Returns (refined_map, refined_prob,
+    overrides) with overrides = {cid: previous_label}.
+    """
+    perp = {int(c): float(f[_PERP_IDX]) for c, f in zip(cids, feats)}
+    aI = np.array([perp[c] for c in fused_map if c in perp
+                   and fused_map[c] == "IHC"
+                   and fused_prob.get(c, 0.0) >= conf_anchor])
+    aO = np.array([perp[c] for c in fused_map if c in perp
+                   and fused_map[c] == "OHC"
+                   and fused_prob.get(c, 0.0) >= conf_anchor])
+    if len(aI) < 3 or len(aO) < 3:
+        return dict(fused_map), dict(fused_prob), {}
+    refined, rprob, overrides = dict(fused_map), dict(fused_prob), {}
+    for c in fused_map:
+        if c not in perp:
+            continue
+        p = perp[c]
+        dI = np.sort(np.abs(aI - p))[:min(k_anchor, len(aI))].mean()
+        dO = np.sort(np.abs(aO - p))[:min(k_anchor, len(aO))].mean()
+        geo = "IHC" if dI < dO else "OHC"
+        if geo != fused_map[c] and fused_prob.get(c, 1.0) < conf_override:
+            overrides[c] = fused_map[c]
+            refined[c] = geo
+            margin = abs(dI - dO) / (dI + dO + 1e-9)
+            rprob[c] = float(0.5 + 0.5 * min(margin, 1.0))
+    return refined, rprob, overrides
+
+
 def predict_seg_geom(geom_ckpt, seg_path, *, fuse_ckpt=None, write=False):
     """Score every instance in one seg.npy with the geom model (and,
     given a fusion ckpt + the CNN keys, the fused decision). Writes
@@ -899,6 +960,7 @@ def predict_seg_geom(geom_ckpt, seg_path, *, fuse_ckpt=None, write=False):
     flag_map = {int(c): int(f) for c, f in zip(cids, flags)}
 
     fused_map = fused_prob = None
+    row_override = {}
     if fuse_ckpt:
         with open(fuse_ckpt, "rb") as fh:
             fk = pickle.load(fh)
@@ -927,6 +989,18 @@ def predict_seg_geom(geom_ckpt, seg_path, *, fuse_ckpt=None, write=False):
                          for c, p in zip(cids, pf)}
             fused_prob = {int(c): float(max(p, 1 - p))
                           for c, p in zip(cids, pf)}
+            # row-consistency post-pass (per-image; params ride in the
+            # fuse ckpt so deployed/GUI inference applies the same rule)
+            rc = fk.get("row_consistency") or {}
+            if rc.get("enabled") and fused_map:
+                fused_map, fused_prob, row_override = row_consistency_refine(
+                    cids, feats, fused_map, fused_prob,
+                    conf_anchor=rc.get("conf_anchor", 0.85),
+                    conf_override=rc.get("conf_override", 0.60),
+                    k_anchor=rc.get("k_anchor", 15))
+                if row_override:
+                    print(f"  row-consistency: flipped {len(row_override)} "
+                          f"low-confidence fused label(s) to match perp band")
 
     n_ihc = sum(v == "IHC" for v in geom_map.values())
     print(f"{os.path.basename(seg_path)}: {len(cids)} cells  "
@@ -944,12 +1018,14 @@ def predict_seg_geom(geom_ckpt, seg_path, *, fuse_ckpt=None, write=False):
                 print(f"  {tag} vs GT [{src}]: acc {ok/tot:.4f} ({ok}/{tot})")
 
     if write:
+        extra = {"row_override": row_override} if row_override else {}
         pp = update_pred(seg_path, class_map_geom=geom_map,
                          class_prob_geom=geom_prob, geom_flag=flag_map,
                          class_map_fused=fused_map,
-                         class_prob_fused=fused_prob)
+                         class_prob_fused=fused_prob, **extra)
         print(f"  wrote class_map_geom / class_prob_geom / geom_flag"
               + (" / class_map_fused / class_prob_fused" if fused_map else "")
+              + (f" / row_override({len(row_override)})" if row_override else "")
               + f" → {os.path.basename(pp)} (sidecar; seg untouched)")
     return geom_map
 

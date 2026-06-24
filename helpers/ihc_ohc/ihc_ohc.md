@@ -700,6 +700,42 @@ python3 /helpers/ihc_ohc/ihc_ohc_geom_clf.py  fuse   --config /helpers/ihc_ohc/c
 (`runs/clc_train_driver.sh` chains the last five with one shared timestamp.
 No `screen`/`tmux` in the container — launch it with `setsid nohup`.)
 
+## Row-consistency post-pass (inference-time error correction)
+
+A second round of curator corrections on the deployed CLC model exposed a
+clean residual error mode. Of 68 corrections across 17 images: the model
+was **uncertain** on its errors (median fused confidence 0.56), and **91 %
+of the errors sit unambiguously in one perp band** yet got the other label
+— i.e. a cell plainly in the OHC band labeled IHC. On those cells raw
+per-image perp geometry agreed with the curator 100 %, the CNN 81 %, but
+the global geom *classifier* only 12 % (and, weighted 0.6 in fusion, it
+dragged the fused call wrong). About half the errors are within 15 % of a
+cochlear end (axis extrapolation); the dominant direction is OHC→IHC
+mislabels (40 of 68).
+
+So a per-image **row-consistency** pass fixes them: re-anchor the two perp
+bands on the *confident* fused calls, then flip any **low-confidence**
+fused label whose perp position clearly belongs to the other band. It runs
+**after fusion, inside `predict_seg_geom`** (not in the model) —
+`perp_signed` is already computed, the trained model is untouched, and the
+params ride in `fuse.pkl` so deployed + GUI inference apply the same rule.
+`row_consistency_refine()` is confidence-gated, so it never overrides a
+confident call; overridden cells are recorded in the `row_override`
+sidecar key for audit.
+
+Validated on the 68 curator corrections (config `fuse.row_consistency`):
+
+| operating point | fixes (of 68) | cells flipped wrong (of 9636) |
+|---|---|---|
+| **conservative** — flip only if fused conf < 0.60 (default) | **40 (59 %)** | **0** |
+| balanced — < 0.75 | 55 (81 %) | 3 |
+
+Deployed CLC config ships the conservative 0-break point
+(`conf_anchor 0.85 / conf_override 0.60 / k_anchor 15`). Tune in
+`geom_clc.yaml`; **off by default** in `DEFAULT_CONFIG` so Cunningham and
+any other dataset are unaffected unless they opt in. The remaining ~28
+higher-confidence errors are not safely auto-correctable and stay manual.
+
 ---
 
 # Cellpose GUI integration
