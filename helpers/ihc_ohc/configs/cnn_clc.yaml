@@ -1,0 +1,36 @@
+# IHC/OHC CNN config — in-house CLC egfp dataset (adult + neonate).
+#
+# Same model + training recipe as configs/cnn.yaml (tuned on Cunningham);
+# only the data paths differ. Labels come from the GUI display merge
+# (class_map_user > fused > geom > pred) via resolve_training_label_map —
+# the CLC segs carry no dataset class_map/XML. Crops are built with
+# `ihc_ohc_crops.py --group_mode clc` so groups = animal id (leak-free).
+#
+# Container paths (/data = /media/DATA/Chris/cellpose2D, /helpers = host
+# cellpose_git/helpers).
+
+data:
+  train_npz: /helpers/ihc_ohc/runs/cache/crops_clc.npz
+  test_npz:  null            # CV estimate + all-data deploy; no held-out dir
+  out_dir:   /helpers/ihc_ohc/runs
+  cnn_ckpt:  null
+
+train:
+  epochs:        40
+  batch_size:    256
+  lr:            0.002
+  weight_decay:  0.0001
+  warmup_epochs: 4
+  select_ema:    0.5
+  sampler:       balanced
+  loss:          ce
+  focal_gamma:   1.5
+  class_weight:  none
+  patience:      15
+  workers:       0           # container /dev/shm is 63 MB — keep 0
+
+cv:
+  folds:    5                # grouped 5-fold by ANIMAL (groups baked into npz)
+  val_frac: 0.2
+
+sweep: {}

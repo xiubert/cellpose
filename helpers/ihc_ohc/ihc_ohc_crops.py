@@ -88,12 +88,38 @@ def base_stem(stem):
     return stem[: -len("_myo7a")] if stem.endswith("_myo7a") else stem
 
 
-def group_key(seg_path):
-    """Source-image id for leak-free splitting.
+_FREQ_RE = re.compile(r"(\d+)\s*khz", re.IGNORECASE)
+_ANIMAL_RE = re.compile(r"^\d+[LR]?$")
 
-    All augmentations of one image must share a split, so prefer the leading
-    numeric prefix (e.g. '000'); fall back to the aug/channel-stripped stem.
+
+def parse_animal(stem):
+    """Animal id = last animal-like token (\\d+[LR]?) before the freq anchor.
+
+    Mirrors clc_split.parse_animal so the IHC/OHC CV groups by animal
+    exactly like the segmentation CV — several tonotopic frequency regions
+    (8/16/32 khz) come from one cochlea and must never straddle a split.
+    'samples_1_4L 8khz' -> 4L (animal glued into the sample token);
+    'Samples_13_63x 5165 8khz' -> 5165. Raises if no animal token found.
     """
+    m = _FREQ_RE.search(stem)
+    head = stem[:m.start()] if m else stem
+    for tok in reversed(re.split(r"[\s_]+", head)):
+        if _ANIMAL_RE.match(tok):
+            return tok
+    raise ValueError(f"could not parse animal id from stem: {stem!r}")
+
+
+def group_key(seg_path, group_mode="numeric"):
+    """Source-id for leak-free splitting (group_mode selects the scheme).
+
+    - "numeric" (default): leading numeric prefix (e.g. '000'); fall back to
+      the aug/channel-stripped stem. This is the Cunningham scheme — all
+      augmentations of one image share a split.
+    - "clc": group by animal id (parse_animal) so a cochlea's frequency
+      regions never straddle a fold (the in-house CLC dataset).
+    """
+    if group_mode == "clc":
+        return parse_animal(seg_stem(seg_path))
     m = re.match(r"(\d+)", os.path.basename(seg_path))
     return m.group(1) if m else base_stem(seg_stem(seg_path))
 
@@ -320,11 +346,33 @@ def resolve_training_label_map(seg, seg_path, data_dir, xml_dir=None):
     train run without anyone re-running label_xfer or hand-editing
     seg.npy files.
 
-    `src` carries the provenance into the npz: "seg", "xml", "seg+user",
-    "xml+user", or "user" (when GT was missing).
+    When a dataset has **no** GT `class_map`/XML at all (e.g. the in-house
+    CLC egfp segs, labeled purely in the GUI), fall back to the accepted
+    model predictions as the base label — `class_map_fused`, then
+    `class_map_geom`, then `class_map_pred`. This mirrors the GUI's
+    `display_label_map` priority (cellpose/gui/celltype.py): the user
+    labeling workflow is "predict, then correct the mislabels," so the
+    per-cell training truth is exactly that merge — a corrected cell takes
+    `class_map_user`, an uncorrected one keeps the reviewed prediction,
+    which is precisely what the GUI tints and the user signs off on.
+    Datasets that *do* carry GT (e.g. Cunningham) never enter this branch,
+    so their behaviour is unchanged.
+
+    `src` carries the provenance into the npz: "seg", "xml", "fused",
+    "geom", "pred", each optionally "+user", or "user" (corrections only).
     """
     cm, src = resolve_class_map(seg, seg_path, data_dir, xml_dir)
     pred = load_pred(seg_path, seg)
+    if not cm:
+        for key, tag in (("class_map_fused", "fused"),
+                         ("class_map_geom", "geom"),
+                         ("class_map_pred", "pred")):
+            base = pred.get(key) or {}
+            if base:
+                cm = {int(k): str(v) for k, v in base.items()
+                      if str(v) in CLASS_TO_IDX}
+                src = tag
+                break
     user = pred.get("class_map_user") or {}
     if not user:
         return cm, src
@@ -405,17 +453,18 @@ def extract_cell_crop(plane, masks, cell_id, *, out_size=64, pad_frac=0.5,
 
 # ── dataset builder ────────────────────────────────────────────────────────────
 
-def iter_seg_files(data_dir, include_augmented=False):
+def iter_seg_files(data_dir, include_augmented=False, group_mode="numeric"):
     """Yield (seg_path, group_key) for every usable _seg.npy in data_dir."""
     for seg_path in sorted(glob.glob(os.path.join(data_dir, "*_seg.npy"))):
         if not include_augmented and is_augmented(seg_stem(seg_path)):
             continue
-        yield seg_path, group_key(seg_path)
+        yield seg_path, group_key(seg_path, group_mode)
 
 
 def build_crop_dataset(data_dir, *, out_size=64, pad_frac=0.5, pad_px=None,
                        pad_value="mean", soft_mask=True, channel=1,
-                       include_augmented=False, xml_dir=None):
+                       include_augmented=False, xml_dir=None,
+                       group_mode="numeric"):
     """Walk data_dir → (crops, labels, groups, image_names).
 
     crops  : (N, 2, S, S) float32   raw intensities
@@ -428,7 +477,7 @@ def build_crop_dataset(data_dir, *, out_size=64, pad_frac=0.5, pad_px=None,
     n_files = n_cells = n_skipped = 0
     src_counter = {"seg": 0, "xml": 0, "none": 0}
 
-    for seg_path, gkey in iter_seg_files(data_dir, include_augmented):
+    for seg_path, gkey in iter_seg_files(data_dir, include_augmented, group_mode):
         try:
             seg = np.load(seg_path, allow_pickle=True).item()
         except Exception as e:  # noqa: BLE001 — keep the batch going
@@ -570,6 +619,9 @@ def parse_args():
                    help="Channel index if a multi-channel TIF is found (default 1=MYO7A)")
     p.add_argument("--include-augmented", action="store_true",
                    help="Also ingest augment.py's on-disk D4 copies")
+    p.add_argument("--group_mode", default="numeric", choices=["numeric", "clc"],
+                   help="leak-free group key: 'numeric' (leading img id, "
+                        "Cunningham) | 'clc' (animal id, in-house CLC)")
     p.add_argument("--xml_dir", default=None,
                    help="Directory of original VOC XMLs (fallback when class_map absent)")
     p.add_argument("--preview", default=None, metavar="PNG",
@@ -585,11 +637,13 @@ def main():
         pad_px=args.pad_px, pad_value=args.pad_value,
         soft_mask=not args.hard_mask, channel=args.channel,
         include_augmented=args.include_augmented, xml_dir=args.xml_dir,
+        group_mode=args.group_mode,
     )
     meta = dict(
         out_size=args.out_size, pad_frac=args.pad_frac, pad_px=args.pad_px,
         pad_value=args.pad_value, soft_mask=not args.hard_mask,
         channel=args.channel, data_dir=os.path.abspath(args.data_dir),
+        group_mode=args.group_mode,
     )
     save_dataset(args.out, crops, labels, groups, image_names, meta)
     if args.preview:

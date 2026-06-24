@@ -87,8 +87,8 @@ from sklearn.preprocessing import StandardScaler
 
 from ihc_ohc_crops import (
     CLASS_NAMES, extract_cell_crop, iter_seg_files, load_image_plane,
-    load_pred, new_run_dir, resolve_class_map, save_run_config, seg_stem,
-    tif_for_seg, update_pred,
+    load_pred, new_run_dir, resolve_class_map, resolve_training_label_map,
+    save_run_config, seg_stem, tif_for_seg, update_pred,
 )
 from ihc_ohc_geom import (
     FEATURE_NAMES, geom_features_for_seg, load_geom_npz,
@@ -110,6 +110,9 @@ DEFAULT_CONFIG = {
         # the crops .npz (only its `meta`, for matching crop geometry).
         "cnn_config": "/helpers/ihc_ohc/configs/cnn.yaml",
         "crops_train_npz": "/helpers/ihc_ohc/runs/cache/crops_train.npz",
+        # leak-free group key for the fuse-side seg walk — must match the
+        # builders' --group_mode: "numeric" (Cunningham) | "clc" (animal id).
+        "group_mode": "numeric",
         # Root for run artifacts; each train/sweep/fuse gets a fresh
         # timestamped subdir (e.g., runs/20260520-104530_train-geom/).
         "out_dir": "/helpers/ihc_ohc/runs",
@@ -425,7 +428,7 @@ def _cnn_pihc(pred, cid):
 
 def assemble_segs(seg_dir, *, k_neighbors, need_cnn, need_gt,
                   with_crops=False, crop_params=None,
-                  include_augmented=False):
+                  include_augmented=False, group_mode="numeric"):
     """Walk seg_dir → aligned per-cell arrays.
 
     Returns dict with feats, p_cnn (P(IHC) or nan), y (or -1), groups,
@@ -440,14 +443,17 @@ def assemble_segs(seg_dir, *, k_neighbors, need_cnn, need_gt,
     gi = {}
     n_missing_cnn = 0
     cp = crop_params or {}
-    for seg_path, gkey in iter_seg_files(seg_dir, include_augmented):
+    for seg_path, gkey in iter_seg_files(seg_dir, include_augmented, group_mode):
         seg = np.load(seg_path, allow_pickle=True).item()
         masks = seg.get("masks")
         if masks is None:
             continue
         gt = {}
         if need_gt:
-            gt, _ = resolve_class_map(seg, seg_path, seg_dir)
+            # training-label resolver, not resolve_class_map: picks up the
+            # GUI display labels (user > fused > geom > pred) for datasets
+            # with no dataset-level GT (CLC). Identical to GT for Cunningham.
+            gt, _ = resolve_training_label_map(seg, seg_path, seg_dir)
             if not gt:
                 continue
         cids, feats, flags, _ = geom_features_for_seg(
@@ -711,15 +717,16 @@ def fuse(cfg, *, run_dir=None):
     kN = mcfg["k_neighbors"]
     cnn_oof = bool(fcfg.get("cnn_oof", True))
 
+    gm = cfg["data"].get("group_mode", "numeric")
     print(f"assembling train segs ({cfg['data']['seg_train_dir']}) …")
     if cnn_oof:
         cp = _crop_params(cfg["data"]["crops_train_npz"])
         tr = assemble_segs(cfg["data"]["seg_train_dir"], k_neighbors=kN,
                            need_cnn=False, need_gt=True,
-                           with_crops=True, crop_params=cp)
+                           with_crops=True, crop_params=cp, group_mode=gm)
     else:
         tr = assemble_segs(cfg["data"]["seg_train_dir"], k_neighbors=kN,
-                           need_cnn=True, need_gt=True)
+                           need_cnn=True, need_gt=True, group_mode=gm)
     print(f"  {len(tr['y'])} cells, {len(np.unique(tr['groups']))} images")
     splits = _splits(tr["groups"], cfg, mcfg["seed"])
 
@@ -833,7 +840,7 @@ def fuse(cfg, *, run_dir=None):
     if cfg["data"].get("seg_test_dir"):
         print(f"\nassembling test segs ({cfg['data']['seg_test_dir']}) …")
         te = assemble_segs(cfg["data"]["seg_test_dir"], k_neighbors=kN,
-                           need_cnn=True, need_gt=True)
+                           need_cnn=True, need_gt=True, group_mode=gm)
         if fcfg["geom_source"] == "rule":
             pg_t = rule_proba_ihc(te["feats"], te["groups"])
         else:

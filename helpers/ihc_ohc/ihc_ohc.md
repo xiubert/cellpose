@@ -16,6 +16,99 @@ artifacts (best.pt, history.json, sweep_results.json, the crops/geom
 `.npz` caches, …) go to `runs/` next to the code — see
 *[Run-artifact layout](#run-artifact-layout)* below.
 
+## Architecture at a glance
+
+The deployed classifier is a **late fusion** of two decorrelated models —
+one reads MYO7A appearance, the other reads where each cell sits in the
+organ of Corti. Their errors are largely independent, so the calibrated,
+threshold-tuned weighted average lifts every metric over either alone
+with no trade-off (CNN 0.951 → geom 0.961 → fused **0.977** bal_acc on
+Cunningham held-out test).
+
+```
+Cellpose-SAM mask  ─┐
+                    ├──► (1) TinyHCNet CNN                         ─┐
+MYO7A TIF          ─┤        on (MYO7A crop, target-mask)           │
+                    │        → P(IHC) ───► class_prob               │
+                    │                                                │
+                    └──► (2) Geometric                              ─┤
+                             PCA centerline + regionprops +         │  weighted
+                             kNN graph features → logreg            │   mean
+                             → P(IHC) ───► class_prob_geom          │  (w = 0.40)
+                                                                    │
+                  ┌──► (3) Late fusion (frozen on OOF train)        ◄┘
+                  │        w·P_cnn + (1-w)·P_geom ≥ 0.440
+                  │        ───► class_map_fused
+                  ▼
+              <stem>_pred.npy  (sidecar; seg untouched)
+                    │
+                    └──► GUI: user clicks/region-selects to correct
+                              ───► class_map_user (sparse, persistent;
+                                   wins per cell on next train rebuild)
+```
+
+- **(1) TinyHCNet** — 3 conv blocks + GroupNorm + GAP → 2-class logits;
+  ~72 k params, trains in minutes on an RTX 2060 SUPER. See *Model* below
+  for why GroupNorm + balanced sampler + EMA-bal_acc selection.
+- **(2) Geometric** — 21-D per-cell vector: regionprops shape, signed
+  perpendicular distance to a per-image **PCA-regression** centerline
+  (the dominant feature — IHC sit on the line, OHC ~3 cells off it),
+  kNN-graph anisotropy, hull-edge distance. Logreg (`class_weight:
+  balanced`). Torch-free.
+- **(3) Fusion** — the CNN's `class_prob` and the geom's `proba_ihc`
+  averaged with a single weight `w` picked **out-of-fold** (`fuse.cnn_oof:
+  true`, so the CNN is retrained per fold rather than read in-sample).
+  McNemar fused-vs-CNN on the test set: 55 cells fixed vs 23 lost,
+  χ²=12.3, p ≈ 4e-4 — the gain is real, not noise.
+
+## Labels in / labels out
+
+**In — what the training pipeline reads.** Per cochlea, training expects
+one `<stem>_seg.npy` + paired `<stem>.tif` in `train_dir/` (and the same
+shape for `test_dir/`). Per-cell labels are resolved by
+**`resolve_training_label_map(seg, seg_path, data_dir)`** in
+[`ihc_ohc_crops.py`](ihc_ohc_crops.py) — used by *both* the crops builder
+and the geom builder, so the two stay aligned. It merges three sources;
+later rows override earlier per cell:
+
+| Order | Source | Where | Note |
+|---|---|---|---|
+| 1 | seg dict | `seg["class_map"]` = `{int: "IHC"\|"OHC"}` | the from-scratch GT — written by `label_xfer.py` from VOC XML; `augment.py` propagates to D4 copies. |
+| 2 | VOC XML | `<base>.xml` (PASCAL VOC bndbox per cell) | fallback when `seg["class_map"]` is missing — each mask gets the class of the box it overlaps most (degenerate <5 px boxes dropped). |
+| 3 | sidecar | `<stem>_pred.npy → class_map_user` = `{int: "IHC"\|"OHC"}` | **the GUI's human-in-the-loop channel** — sparse (only the cells the user clicked); *wins per cell* over both above. |
+
+`<base>` for the XML lookup drops the `_myo7a` suffix and any D4 aug
+tag, so one XML maps to every variant of one cochlea. Cells with **no**
+source after merging are silently skipped at crop/geom-build time and
+counted in the per-image summary. The provenance tag (`"seg"`, `"xml"`,
+`"user"`, `"seg+user"`, `"xml+user"`) is recorded so you can audit later
+which cochleae contributed which kind of label.
+
+**Out — what `predict` writes.** All predictions go to a
+**`<stem>_pred.npy` sidecar** next to the seg, never into the dataset
+seg itself. Atomic write (tmp file + `os.replace`). Eight keys total
+across the three classifiers and the GUI label channel; each is
+`{int_mask_id: …}`:
+
+| Key | Producer | Type | Coverage | Meaning |
+|---|---|---|---|---|
+| `class_map_pred`   | CNN  | `str`   | every mask | `"IHC"` or `"OHC"` |
+| `class_prob`       | CNN  | `float` | every mask | P of the predicted class (≥ 0.5 by definition) |
+| `class_map_geom`   | geom | `str`   | every mask | `"IHC"` or `"OHC"` |
+| `class_prob_geom`  | geom | `float` | every mask | P of the predicted class |
+| `geom_flag`        | geom | `int`   | every mask | bitmask: ≥ 1 ⇒ off-axis / sparse / extrapolated / too-few-cells — human review hint |
+| `class_map_fused`  | fuse | `str`   | every mask | **the deployed label** — what the GUI / `plot` colour-codes by default |
+| `class_prob_fused` | fuse | `float` | every mask | P of the predicted class |
+| `class_map_user`   | **GUI** | `str` | **sparse — only cells the user clicked** | hand-applied class; **survives `predict` re-runs** (GUI: `run_celltype` snapshots-then-wipes; CLI: `update_pred` merges so user labels are never overwritten) and feeds the next training rebuild via `resolve_training_label_map`. |
+
+The GUI's celltype handler walks `class_map_user → class_map_fused →
+class_map_geom → class_map_pred` and uses whichever is present — so user
+clicks always override model output in the display. `load_pred(seg_path,
+seg)` reads the sidecar (with a transparent in-seg fallback for
+pre-sidecar data); `set_user_label` / `set_user_labels_bulk` in
+[`cellpose/gui/celltype.py`](../../cellpose/gui/celltype.py) are how the
+GUI persists clicks atomically. See also *Prediction sidecars* below.
+
 ## Pipeline
 
 ```
@@ -543,6 +636,72 @@ single combined model is required for deployment.
 
 ---
 
+# In-house CLC dataset (egfp) — a second, separately-deployed model
+
+The same stack retrained on the in-house **CLC** cochlear data
+(`/data/cellpose_cc/{adult,neonate}`, egfp marker, 66 images / 20 animals
+/ 9617 cells, ~23% IHC). It is a **separate** model — Cunningham's locked
+model, configs and manifest are untouched. Configs:
+[`configs/cnn_clc.yaml`](configs/cnn_clc.yaml),
+[`configs/geom_clc.yaml`](configs/geom_clc.yaml); GUI manifest
+[`clc_ihc_ohc.yaml`](clc_ihc_ohc.yaml).
+
+**Held-out (OOF, grouped 5-fold by animal):**
+
+| Config | bal_acc | acc | IHC rec | OHC rec | macro-F1 |
+|---|---|---|---|---|---|
+| CNN alone | 0.956 ± 0.032 | — | — | — | — |
+| geom alone | 0.974 ± 0.008 | — | — | — | — |
+| **CNN ⊕ geom (mean, calibrated)** | **0.984** | 0.986 | 0.980 | 0.988 | 0.981 |
+
+`w = 0.40` (CNN share), fused threshold 0.400; McNemar fused-vs-CNN
+p ≈ 1e-28. On par with Cunningham — the geom side (stain-agnostic
+cochlear-row geometry) transfers and refits with no surprises; the CNN had
+to relearn the egfp appearance (the deployed Cunningham CNN was degenerate
+here, predicting all-IHC). Deployed run: `runs/20260624-003309_clc-*`.
+
+Three CLC-specific differences from the Cunningham flow — each is a one-
+line knob, none changes the Cunningham path:
+
+1. **Labels = the GUI display merge, not a dataset `class_map`.** CLC segs
+   carry no `class_map`/XML. The per-cell training truth is
+   `class_map_user` (the curator's corrections) over `class_map_fused`
+   (the reviewed prediction) — exactly `celltype.display_label_map`'s
+   priority — because the labeling workflow is "predict, then correct the
+   mislabels." `resolve_training_label_map` falls back to
+   `fused → geom → pred` **only when no GT exists**, so Cunningham is
+   unchanged. The merged labels sit at a tight 21–25% IHC per image.
+2. **egfp signal is in channel 0** of the RGB-wrapped `_chNN_SV.tif`
+   (channel 1 is blank — the default `--channel 1` trains on an all-black
+   plane; caught at the crops preview). Build CLC crops with
+   `--channel 0`; it propagates to fusion/inference via the npz `meta`.
+3. **Leak-free grouping is by animal**, not image (a cochlea's 8/16/32 khz
+   regions must not straddle a fold). `--group_mode clc` on the builders
+   and `data.group_mode: clc` in `geom_clc.yaml` mirror
+   `clc_split.parse_animal`.
+
+Rebuild (inside the container):
+
+```bash
+DST=/data/cellpose_cc/clc_ihc_ohc_all   # 66 seg+tif+pred relative symlinks
+python3 /helpers/ihc_ohc/ihc_ohc_crops.py --data_dir $DST \
+    --group_mode clc --channel 0 --out /helpers/ihc_ohc/runs/cache/crops_clc.npz \
+    --preview /helpers/ihc_ohc/runs/cache/crops_clc_preview.png   # EYEBALL THIS
+python3 /helpers/ihc_ohc/ihc_ohc_geom.py  --data_dir $DST \
+    --group_mode clc --out /helpers/ihc_ohc/runs/cache/geom_clc.npz
+python3 /helpers/ihc_ohc/ihc_ohc_classifier.py cv   --config /helpers/ihc_ohc/configs/cnn_clc.yaml
+python3 /helpers/ihc_ohc/ihc_ohc_geom_clf.py  cv    --config /helpers/ihc_ohc/configs/geom_clc.yaml
+# deploy (all data): train CNN + geom, then fuse (OOF CNN per fold)
+python3 /helpers/ihc_ohc/ihc_ohc_classifier.py train --config /helpers/ihc_ohc/configs/cnn_clc.yaml
+python3 /helpers/ihc_ohc/ihc_ohc_geom_clf.py  train  --config /helpers/ihc_ohc/configs/geom_clc.yaml
+python3 /helpers/ihc_ohc/ihc_ohc_geom_clf.py  fuse   --config /helpers/ihc_ohc/configs/geom_clc.yaml
+```
+
+(`runs/clc_train_driver.sh` chains the last five with one shared timestamp.
+No `screen`/`tmux` in the container — launch it with `setsid nohup`.)
+
+---
+
 # Cellpose GUI integration
 
 A "cell-type classifier" button now sits in the Cellpose GUI's left
@@ -619,3 +778,285 @@ GUI has masks loaded. Each click:
   `sys.path` on first use, so the GUI process needs to be running inside
   (or with that path mounted into) the cellpose container — same as the
   rest of this pipeline.
+
+---
+
+# Adding more training data
+
+The training pipeline reads three sources for per-cell labels
+(`resolve_training_label_map`, see *[Labels in / labels out](#labels-in--labels-out)*).
+You almost certainly want the third — **`class_map_user` in the
+`<stem>_pred.npy` sidecar** — because it's what the GUI's
+hand-correction tool writes, so adding training data is a closed loop
+through the GUI with no scripts to author.
+
+## The active-learning loop (recommended)
+
+This is the workflow the neonate set in
+`/media/DATA/Chris/cellpose2D/cellpose_cc/neonate/` was built with — and
+the same idea generalises to any new tissue / age / stain.
+
+1. **Segment with Cellpose-SAM** to produce `<stem>_seg.npy` (+ paired
+   `.tif`) per cochlea. No `class_map` in the seg is fine — the
+   pipeline supports starting from nothing.
+
+2. **Run the deployed celltype classifier** to seed predictions. Two
+   options:
+
+   - In the GUI: register
+     [`cunningham_ihc_ohc.yaml`](cunningham_ihc_ohc.yaml) (see
+     *[Cellpose GUI integration](#cellpose-gui-integration)*), open
+     each seg, click *run*. Writes `class_map_pred / class_map_geom /
+     class_map_fused` + probabilities into the sidecar.
+   - Or batch on the CLI:
+
+     ```bash
+     podman exec cellpose python3 /helpers/ihc_ohc/ihc_ohc_pipeline.py predict \
+         --dir /data/path/to/new_cochleae/ \
+         --cnn_ckpt  /helpers/ihc_ohc/runs/20260519-114530_train-cnn/best.pt \
+         --geom_ckpt /helpers/ihc_ohc/runs/20260519-145037_train-geom/geom_best.pkl \
+         --fuse_ckpt /helpers/ihc_ohc/runs/20260519-165125_fuse/fuse.pkl
+     ```
+
+3. **Correct in the GUI.** Click or region-select the cells the model
+   got wrong; the GUI calls `set_user_labels_bulk` which writes
+   `class_map_user` into the sidecar. You don't have to relabel every
+   cell — only the ones you disagree with. (For the neonate set today,
+   `class_map_user` is partial: 18–101 OHC corrections per cochlea, out
+   of ~143–167 total masks. That's fine: only labeled cells contribute
+   to training, the rest are dropped at crop/geom-build time.)
+
+   `class_map_user` is **persistent** — re-running `predict` snapshots
+   it first and re-applies it on top of the fresh predictions, so user
+   work never gets overwritten by a model re-run.
+
+4. **Decide what counts as "in the train set."** Three rough heuristics:
+
+   - **High-trust corrections:** clear, unambiguous cells the user
+     hand-clicked are real GT. Use them.
+   - **Watch the class balance.** If the user has only labeled one
+     class (e.g. the neonate sidecars are all `OHC`-only — see
+     *Caveats* below), training on that subset alone biases the
+     classifier. Either label the other class too, or weight that
+     cochlea's contribution down via `--include-augmented` / not.
+   - **Skip `geom_flag > 0` cells** that the user didn't label — those
+     are the geom's "I'm uncertain" flag, so model labels on them are
+     least trustworthy and shouldn't be promoted without a human.
+
+5. **Drop the dir into `train_dir/` (or a sibling dir) and rebuild the
+   caches.** The crop/geom builders walk every `*_seg.npy` under
+   `--data_dir`, call `resolve_training_label_map`, and bake the merged
+   labels into the npz — no further wiring needed:
+
+   ```bash
+   # crops .npz now includes the labeled cells from the new cochleae too
+   podman exec cellpose python3 /helpers/ihc_ohc/ihc_ohc_crops.py \
+       --data_dir /data/path/to/combined_train/ \
+       --out     /helpers/ihc_ohc/runs/cache/crops_train.npz \
+       --preview /helpers/ihc_ohc/runs/cache/crops_train_preview.png
+   # same for geom_train.npz with ihc_ohc_geom.py
+   ```
+
+   The per-image log lines show the provenance tag — look for `[user]`
+   or `[seg+user]` to confirm new cochleae actually contributed cells.
+
+6. **Retrain.** Run the full pipeline (`ihc_ohc_pipeline.py train …`) or
+   the individual `train`/`fuse` CLIs — see *[Reproducible
+   runbook](#reproducible-runbook--what-produced-the-deployed-0981)*
+   below. Each step writes to a fresh timestamped run dir; the old
+   deployed models stay put until you update the YAML to point at the
+   new ones.
+
+## Path B — annotated VOC-XML bounding boxes (the original Cunningham recipe)
+
+If you have hand-drawn boxes in PASCAL VOC XML form (the format the
+upstream HCAT-data ships), use that path instead — it produces a dense
+`class_map` covering every mask:
+
+```bash
+# writes class_map into every _seg.npy in data_dir, based on max-overlap
+# with the matching <base>.xml. See helpers/label_xfer.py.
+podman exec cellpose python3 /helpers/label_xfer.py \
+    --data_dir /data/path/to/new_cochleae/
+```
+
+After that, the cochleae become indistinguishable from Cunningham as far
+as training is concerned — `seg["class_map"]` is the source, no user
+sidecar needed.
+
+## Caveats with the current `class_map_user` data
+
+A quick survey of the neonate sidecars
+(`/media/DATA/Chris/cellpose2D/cellpose_cc/neonate/`) shows two patterns
+worth flagging before retraining:
+
+- **All `class_map_user` entries to date are `"OHC"`** — the user has
+  been correcting *only* the cells the model mislabeled as IHC. That's
+  the right active-learning instinct, but it means:
+  - the labeled subset has *no* positive IHC examples per neonate
+    cochlea
+  - the CNN's `sampler: balanced` will still try to give it ~50/50
+    batches drawn from the *whole* pool (Cunningham + neonate), so IHC
+    examples come from Cunningham only — fine for now, but worth a
+    second pass to label some clear IHC for shape coverage at the
+    neonate end of the manifold.
+- **Coverage is variable** (18 cells on one cochlea, 101 on another).
+  Cochleae with very few user labels contribute very few cells to
+  training. Check the per-image build log after the next
+  `ihc_ohc_crops.py` run to see who pulls weight.
+
+## Sanity checks before retraining
+
+- `iter_seg_files(train_dir)` should report the new cochleae alongside
+  the old:
+
+  ```bash
+  podman exec cellpose python3 -c "
+  import sys; sys.path.insert(0, '/helpers/ihc_ohc')
+  from ihc_ohc_crops import iter_seg_files
+  print(sum(1 for _ in iter_seg_files('/data/.../combined_train')), 'cochleae')"
+  ```
+
+- The leading numeric prefix (`group_key` in
+  [`ihc_ohc_crops.py`](ihc_ohc_crops.py)) must be **disjoint** between
+  `train/` and `test/` or splits will leak. If you're adding cochleae,
+  bump the prefix past the highest existing one (`ls train/ | sort -n |
+  tail`). For the neonate files (no numeric prefix), `group_key` falls
+  back to the aug/channel-stripped stem — fine, but check by-hand that
+  the same cochlea doesn't appear in both dirs.
+
+- Eyeball `runs/cache/crops_train_preview.png` after rebuilding. Strongly
+  skewed counts (e.g. 95 % OHC after adding the neonate set) usually
+  means the user-label distribution is what's driving it — see *Caveats*
+  above.
+
+---
+
+# Reproducible runbook — what produced the deployed 0.977
+
+This is the exact path that yielded the legacy artifacts now preserved
+in `runs/20260519-*_…/`. All commands run inside the cellpose container
+(see [Run everything inside the container](../../../CLAUDE.md) in the
+project README for the mount layout); `$DATA` is
+`/data/to_zip/hcat-data/Confocal/Cunningham/traintest`.
+
+### 0. One-time setup
+
+```bash
+# Container deps not in stock cellpose
+podman exec cellpose pip install -r /helpers/ihc_ohc/requirements.txt
+```
+
+### 1. Build crops (CNN input)
+
+```bash
+podman exec cellpose python3 /helpers/ihc_ohc/ihc_ohc_crops.py \
+    --data_dir $DATA/train \
+    --out     /helpers/ihc_ohc/runs/cache/crops_train.npz \
+    --preview /helpers/ihc_ohc/runs/cache/crops_train_preview.png
+
+podman exec cellpose python3 /helpers/ihc_ohc/ihc_ohc_crops.py \
+    --data_dir $DATA/test \
+    --out     /helpers/ihc_ohc/runs/cache/crops_test.npz
+```
+
+→ 93 train cochleae / 23 test cochleae, 1427 test cells. Eyeball the
+preview PNG before going further.
+
+### 2. Build the geom feature table (geom input)
+
+```bash
+podman exec cellpose python3 /helpers/ihc_ohc/ihc_ohc_geom.py \
+    --data_dir $DATA/train \
+    --out     /helpers/ihc_ohc/runs/cache/geom_train.npz \
+    --preview /helpers/ihc_ohc/runs/cache/geom_train_preview.png
+
+podman exec cellpose python3 /helpers/ihc_ohc/ihc_ohc_geom.py \
+    --data_dir $DATA/test \
+    --out     /helpers/ihc_ohc/runs/cache/geom_test.npz
+```
+
+### 3. (Optional) sweep + cross-validate
+
+The defaults in `configs/cnn.yaml` and `configs/geom.yaml` *are* the
+sweep winners — only repeat this if you've changed the data
+substantially. Edit the `sweep:` block in the relevant yaml first, then:
+
+```bash
+podman exec cellpose python3 /helpers/ihc_ohc/ihc_ohc_classifier.py sweep \
+    --config /helpers/ihc_ohc/configs/cnn.yaml
+podman exec cellpose python3 /helpers/ihc_ohc/ihc_ohc_classifier.py cv \
+    --config /helpers/ihc_ohc/configs/cnn.yaml
+```
+
+For the deployed model: `lr=0.002, loss=ce, select_ema=0.5,
+class_weight=none, sampler=balanced` (CNN); `type=logreg,
+class_weight=balanced, C=1.0, k_neighbors=6` (geom). Both are the
+current defaults — sweep history in *Model choice* below.
+
+### 4. Train, in a screen session
+
+The orchestrator threads one timestamp across all three steps so the run
+dirs cluster. Use screen so you can detach and monitor:
+
+```bash
+screen -dmS ihc_train -L -Logfile /tmp/ihc_train.log bash -c "
+podman exec cellpose python3 /helpers/ihc_ohc/ihc_ohc_pipeline.py train \
+    --train_dir $DATA/train \
+    --test_dir  $DATA/test \
+    --cnn_config  /helpers/ihc_ohc/configs/cnn.yaml \
+    --geom_config /helpers/ihc_ohc/configs/geom.yaml
+"
+# attach to watch:   screen -r ihc_train
+# detach again:      Ctrl-A  d
+```
+
+Wall-clock on a 2060 SUPER: ~5 min CNN train + ~20 s geom + ~25 min
+fusion (the OOF CNN retrains 5 CNNs, one per fold — that's the bulk).
+
+The orchestrator prints three sibling run dirs at the end, all sharing
+one timestamp:
+
+```
+✓ pipeline complete:
+   CNN  ckpt → /helpers/ihc_ohc/runs/<stamp>_train-cnn/best.pt
+   geom ckpt → /helpers/ihc_ohc/runs/<stamp>_train-geom/geom_best.pkl
+   fuse ckpt → /helpers/ihc_ohc/runs/<stamp>_fuse/fuse.pkl
+```
+
+Each dir also contains a frozen `config.yaml`, the resolved input config
+exactly as the run saw it.
+
+### 5. Promote the new run to "deployed"
+
+There's no symlink — `data.cnn_ckpt` / `geom_ckpt` / `fuse_ckpt` in the
+two YAML configs is the single source of truth for "what `predict`
+loads." Edit them to point at the three paths the pipeline just printed:
+
+```yaml
+# configs/cnn.yaml
+data:
+  cnn_ckpt: /helpers/ihc_ohc/runs/<new-stamp>_train-cnn/best.pt
+
+# configs/geom.yaml
+data:
+  geom_ckpt: /helpers/ihc_ohc/runs/<new-stamp>_train-geom/geom_best.pkl
+  fuse_ckpt: /helpers/ihc_ohc/runs/<new-stamp>_fuse/fuse.pkl
+```
+
+Also update [`cunningham_ihc_ohc.yaml`](cunningham_ihc_ohc.yaml) (the
+GUI manifest) to point at the new dirs if you want the GUI to pick up
+the new model.
+
+### 6. Confirm against the held-out test
+
+```bash
+podman exec cellpose python3 /helpers/ihc_ohc/ihc_ohc_pipeline.py predict \
+    --dir $DATA/test
+```
+
+The per-image `vs GT [seg]: acc …` lines and the McNemar test printed by
+`fuse` are the headline. The locked target for the Cunningham set is
+**0.977 fused bal_acc / 0.970 macro-F1** — anything materially below
+that on the same data is a regression, treat the new run as a candidate
+not a replacement.

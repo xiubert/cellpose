@@ -1,0 +1,23 @@
+# Cell-type classifier manifest for the Cellpose GUI — in-house CLC egfp
+# dataset (adult + neonate cochleae). Sibling of cunningham_ihc_ohc.yaml;
+# the Cunningham model is unchanged and still its own manifest.
+#
+# Register via Models menu → "Add cell-type classifier (manifest .yaml)" →
+# pick this file. Relative ckpt paths resolve against this file's dir
+# (helpers/ihc_ohc/). Container paths assumed (GUI runs in the container).
+#
+# Trained on the GUI-reviewed labels (class_map_user > fused > geom > pred)
+# of 66 CLC images / 20 animals, channel-0 egfp, leak-free grouped-by-animal.
+# Held-out (OOF, grouped 5-fold by animal): CNN 0.956 / geom 0.974 /
+# fused bal_acc 0.984, macro-F1 0.981 (w=0.40 CNN share, th=0.400).
+
+name: clc-ihc-ohc
+cnn_ckpt:  runs/20260624-003309_clc-train-cnn/best.pt
+geom_ckpt: runs/20260624-003309_clc-train-geom/geom_best.pkl
+fuse_ckpt: runs/20260624-003309_clc-fuse/fuse.pkl
+
+# Per-class mask tint (RGB 0–255). Magenta + cyan stay readable over the
+# red or green fluorescence channel.
+classes:
+  IHC: [232, 38, 220]   # magenta
+  OHC: [40, 220, 230]   # cyan

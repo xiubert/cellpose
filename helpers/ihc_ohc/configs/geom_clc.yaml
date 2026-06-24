@@ -1,0 +1,45 @@
+# Geometric IHC/OHC classifier + CNN-fusion config — in-house CLC dataset.
+#
+# Parallels configs/geom.yaml; only data paths + group_mode differ. The
+# geom features are stain-agnostic (pure cochlear-row geometry) so the
+# model transfers; this refits it to the CLC label distribution and fuses
+# with the CLC-retrained CNN. Labels via the GUI display merge
+# (resolve_training_label_map). group_mode: clc → leak-free by animal.
+#
+# Container paths (/data = /media/DATA/Chris/cellpose2D, /helpers = host
+# cellpose_git/helpers).
+
+data:
+  geom_train_npz: /helpers/ihc_ohc/runs/cache/geom_clc.npz
+  geom_test_npz:  null
+  seg_train_dir:  /data/cellpose_cc/clc_ihc_ohc_all
+  seg_test_dir:   null
+  cnn_config:     /helpers/ihc_ohc/configs/cnn_clc.yaml
+  crops_train_npz: /helpers/ihc_ohc/runs/cache/crops_clc.npz
+  group_mode:     clc        # animal-id grouping for the fuse-side seg walk
+  out_dir:        /helpers/ihc_ohc/runs
+  geom_ckpt: null
+  fuse_ckpt: null
+
+model:
+  type:          logreg
+  class_weight:  balanced
+  C:             1.0
+  k_neighbors:   6
+  seed:          0
+
+fuse:
+  method:      mean
+  weight_grid: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+  geom_source: model
+  cnn_oof:     true
+  calibrate:   isotonic
+  calibrate_components: [cnn, geom]
+  threshold_grid: [0.30, 0.32, 0.34, 0.36, 0.38, 0.40, 0.42, 0.44, 0.46, 0.48,
+                   0.50, 0.52, 0.54, 0.56, 0.58, 0.60, 0.62, 0.64, 0.66, 0.68, 0.70]
+
+cv:
+  folds:    5                # grouped 5-fold by ANIMAL
+  val_frac: 0.2
+
+sweep: {}

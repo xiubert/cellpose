@@ -349,7 +349,7 @@ def geom_features_for_seg(seg, *, k_neighbors=6, min_cells=6):
 # ── dataset builder ─────────────────────────────────────────────────────────────
 
 def build_geom_dataset(data_dir, *, k_neighbors=6, include_augmented=False,
-                        xml_dir=None):
+                        xml_dir=None, group_mode="numeric"):
     """Walk data_dir → (feats, labels, groups, cell_ids, flags, names).
 
     Same seg-walking / label-resolution / image-grouping as the crop
@@ -361,7 +361,7 @@ def build_geom_dataset(data_dir, *, k_neighbors=6, include_augmented=False,
     n_files = n_cells = n_skipped = 0
     src_counter = {"seg": 0, "xml": 0, "none": 0}
 
-    for seg_path, gkey in iter_seg_files(data_dir, include_augmented):
+    for seg_path, gkey in iter_seg_files(data_dir, include_augmented, group_mode):
         try:
             seg = np.load(seg_path, allow_pickle=True).item()
         except Exception as e:  # noqa: BLE001
@@ -513,6 +513,9 @@ def parse_args():
                    help="k for the neighbour-graph features (default 6)")
     p.add_argument("--include-augmented", action="store_true",
                    help="Also ingest augment.py's on-disk D4 copies")
+    p.add_argument("--group_mode", default="numeric", choices=["numeric", "clc"],
+                   help="leak-free group key: 'numeric' (leading img id, "
+                        "Cunningham) | 'clc' (animal id, in-house CLC)")
     p.add_argument("--xml_dir", default=None,
                    help="VOC XML dir (fallback when class_map is absent)")
     p.add_argument("--preview", default=None, metavar="PNG",
@@ -525,9 +528,11 @@ def main():
     print(f"Building geometric features from {args.data_dir}")
     feats, labels, groups, cell_ids, flags, names = build_geom_dataset(
         args.data_dir, k_neighbors=args.k_neighbors,
-        include_augmented=args.include_augmented, xml_dir=args.xml_dir)
+        include_augmented=args.include_augmented, xml_dir=args.xml_dir,
+        group_mode=args.group_mode)
     meta = dict(k_neighbors=args.k_neighbors,
                 data_dir=os.path.abspath(args.data_dir),
+                group_mode=args.group_mode,
                 feature_names=FEATURE_NAMES)
     save_geom_dataset(args.out, feats, labels, groups, cell_ids, flags,
                       names, meta)
