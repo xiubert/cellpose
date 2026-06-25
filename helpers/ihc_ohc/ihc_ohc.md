@@ -773,6 +773,56 @@ higher-confidence errors are not safely auto-correctable and stay manual.
 
 ---
 
+# Evaluation caveats & known limitations
+
+A review of the pipeline (June 2026) found the train/val **leakage hygiene
+sound** — splits are leak-free by animal (`group_split` / `GroupKFold` on
+the animal-id groups), CNN norm stats are computed on the train fold only,
+the fusion OOF retrains per fold with a nested sub-val carved by group, and
+the geom centerline is label-free. The CV/OOF numbers are therefore
+honest *generalisation* estimates. Three caveats remain, and they bear on
+how much to trust the **absolute** ~0.98 (the *relative* model ranking —
+geom > CNN, fused > geom — is unaffected by all three):
+
+1. **Operating-point selection optimism (CLC).** The fusion weight `w`,
+   the decision threshold, *and* the isotonic calibrators are fit on the
+   OOF train, and the headline fused bal_acc (0.984–0.987) is reported on
+   that **same** OOF. Cunningham keeps a truly held-out test (its more
+   conservative 0.977); the CLC model deploys on all 66 images, so it has
+   **no untouched test set**. The optimism is small (w/threshold are
+   low-dimensional grid picks) but real and undocumented elsewhere. To get
+   an unbiased read, hold out 2–3 animals as a final single-read test (or
+   nest the (w, th, calibrator) selection inside the OOF).
+
+2. **Label circularity (CLC).** CLC has no independent ground truth: the
+   training labels are the curator's corrections layered over the *prior*
+   model's `class_map_fused` (the GUI display merge), and the evaluation
+   truth is that same merged set. So (a) the new model is partly trained to
+   reproduce the previous model on uncorrected cells, and (b) absolute
+   accuracy is graded against labels partly produced by a model, which
+   inflates it. The second correction round (68 new errors) is direct
+   evidence of residual label noise. The only clean fix is a small
+   **fully hand-labelled gold set** (1–2 animals, no model in the loop) for
+   an unbiased absolute number; Cunningham's VOC-XML GT is independent and
+   not subject to this.
+
+3. **In-sample calibration / ECE.** The calibrators are fit on the OOF
+   preds and ECE is reported on the same data, so the printed
+   `ECE → 0.0000` is an in-sample figure, **not** a generalisation measure
+   (the deployed calibrator itself is fine — it is applied to fresh data).
+   Don't quote that ECE as evidence of calibration quality.
+
+**Realistic bottom line:** the honest absolute accuracy is probably a touch
+below the reported ~0.98, still strong; the deployed stack and every
+*comparative* conclusion in this doc stand.
+
+Directory inference is **batched**: `predict_seg_geom_dir` (and the CNN's
+`cnn_predict_dir`) load each model once and score every seg in-process —
+`ihc_ohc_pipeline.py predict --dir` no longer spawns a subprocess per seg
+(≈15–20× faster on a full directory).
+
+---
+
 # Cellpose GUI integration
 
 A "cell-type classifier" button now sits in the Cellpose GUI's left

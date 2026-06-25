@@ -208,13 +208,13 @@ def cmd_predict(args):
     py = sys.executable
 
     if args.dir:
-        from ihc_ohc_crops import iter_seg_files
         print(f"=== CNN write-back over {args.dir} ===")
         cnn_predict_dir(cnn_ckpt, args.dir)
-        for sp, _ in iter_seg_files(args.dir):
-            _run([py, f"{HOST}/ihc_ohc_geom_clf.py", "predict",
-                  "--geom_ckpt", geom_ckpt, "--fuse_ckpt", fuse_ckpt,
-                  "--fuse", "--seg", sp, "--write"])
+        # Batched geom+fusion write-back: loads the geom/fuse ckpts once
+        # (was a per-seg subprocess loop reloading both pickles each time).
+        print(f"=== geom+fusion write-back over {args.dir} ===")
+        from ihc_ohc_geom_clf import predict_seg_geom_dir
+        predict_seg_geom_dir(geom_ckpt, args.dir, fuse_ckpt=fuse_ckpt, write=True)
     else:
         # single seg: the two per-seg CLIs as-is (single source of truth)
         _run([py, f"{HOST}/ihc_ohc_classifier.py", "predict",

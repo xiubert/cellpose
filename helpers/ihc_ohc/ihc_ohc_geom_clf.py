@@ -971,9 +971,44 @@ def predict_seg_geom(geom_ckpt, seg_path, *, fuse_ckpt=None, write=False):
     """Score every instance in one seg.npy with the geom model (and,
     given a fusion ckpt + the CNN keys, the fused decision). Writes
     class_map_geom / class_prob_geom / geom_flag (+ _fused) — masks and
-    the CNN's keys are left untouched."""
+    the CNN's keys are left untouched. For a whole directory use
+    `predict_seg_geom_dir` (loads the ckpts once)."""
     with open(geom_ckpt, "rb") as fh:
         gk = pickle.load(fh)
+    fk = None
+    if fuse_ckpt:
+        with open(fuse_ckpt, "rb") as fh:
+            fk = pickle.load(fh)
+    return _score_seg_geom(gk, fk, seg_path, write=write)
+
+
+def predict_seg_geom_dir(geom_ckpt, data_dir, *, fuse_ckpt=None, write=True,
+                         include_augmented=False):
+    """Batched geom (+ fusion) inference over a directory.
+
+    Loads the geom and fuse ckpts **once** and scores every seg in-process
+    — the geom analogue of `ihc_ohc_pipeline.cnn_predict_dir`, replacing the
+    old per-seg subprocess loop (which reloaded both pickles and re-imported
+    sklearn for each of N segs). Sidecars only; the dataset segs are
+    untouched."""
+    with open(geom_ckpt, "rb") as fh:
+        gk = pickle.load(fh)
+    fk = None
+    if fuse_ckpt:
+        with open(fuse_ckpt, "rb") as fh:
+            fk = pickle.load(fh)
+    n = 0
+    for sp, _ in iter_seg_files(data_dir, include_augmented):
+        _score_seg_geom(gk, fk, sp, write=write)
+        n += 1
+    print(f"  geom write-back: {n} sidecars (seg files untouched) in {data_dir}")
+    return n
+
+
+def _score_seg_geom(gk, fk, seg_path, *, write=False):
+    """Score one seg with already-loaded geom (`gk`) and fuse (`fk` or None)
+    ckpts — the per-seg core shared by `predict_seg_geom` and
+    `predict_seg_geom_dir`."""
     model = (gk["scaler"], gk["clf"])
     kN = gk["model_cfg"]["k_neighbors"]
 
@@ -990,9 +1025,7 @@ def predict_seg_geom(geom_ckpt, seg_path, *, fuse_ckpt=None, write=False):
 
     fused_map = fused_prob = None
     row_override = {}
-    if fuse_ckpt:
-        with open(fuse_ckpt, "rb") as fh:
-            fk = pickle.load(fh)
+    if fk is not None:
         pred = load_pred(seg_path, seg)
         pc = np.array([_cnn_pihc(pred, int(c)) if pred else None
                        for c in cids], float)
