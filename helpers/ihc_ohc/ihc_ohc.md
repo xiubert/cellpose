@@ -680,6 +680,21 @@ geom 12 %, i.e. geom (weighted 0.6) outvoted a correct CNN — which is the
 slice the row-consistency post-pass below cleans up. (Per-run CNN variance
 shifts these by <1 pt vs the deployed run.)
 
+**Confidence-adaptive fusion weight — tested, rejected.** The asymmetry
+above suggested giving the CNN more weight where geom is *unsure*
+(`w_eff = w_lo + (w_hi−w_lo)·(1−g)`, `g = 2·|p_geom−0.5|`). A Phase-0
+headroom check on the OOF predictions (`oof_preds.npz`, now saved by every
+`fuse` run) confirmed the *premise* — in the `g<0.6` buckets geom accuracy
+is 0.52–0.77 while the CNN is 0.84–0.92 and rescues ~85–95 % of geom's
+errors — but **killed the idea on headroom**: only 2.6 % of cells have
+`g<0.6` (95 % sit at `g≥0.8` where geom is 0.995). The per-cell *oracle*
+ceiling (best possible geom/CNN switch) is just **+0.005 bal_acc**; the
+OOF-tuned adaptive-mean gains **+0.0004** and is not significant
+(McNemar p=0.12, fixed-w actually winning 14 vs 6). Not worth 2 extra
+params on 20 animals — and the row-consistency post-pass already harvests
+that low-confidence slice more robustly (per-image geometry, 40/68 fixed,
+0 breaks). Kept fixed `w=0.40`.
+
 Three CLC-specific differences from the Cunningham flow — each is a one-
 line knob, none changes the Cunningham path:
 

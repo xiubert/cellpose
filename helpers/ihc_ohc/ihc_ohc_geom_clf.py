@@ -868,6 +868,18 @@ def fuse(cfg, *, run_dir=None):
         pickle.dump(ckpt, fh)
     print(f"saved fusion ckpt → {ckpt_path}")
 
+    # Per-cell OOF predictions — enables offline fusion analysis (adaptive
+    # weighting, oracle ceilings) without re-retraining the per-fold CNNs.
+    oof_path = os.path.join(run_dir, "oof_preds.npz")
+    np.savez_compressed(
+        oof_path, y=y, groups=tr["groups"],
+        pc_raw=pc_raw, pg_raw=pg_raw, pc_cal=pc, pg_cal=pg, p_fused=p_fused,
+        names=np.asarray([r[0] for r in tr["ref"]], dtype=object),
+        cell_ids=np.asarray([r[1] for r in tr["ref"]], dtype=np.int64),
+        fused_w=float(fused_cfg.get("weight", np.nan)),
+        fused_th=float(fused_cfg.get("threshold", 0.5)))
+    print(f"saved OOF per-cell preds → {oof_path}")
+
     # held-out test: refit geom on ALL train, freeze fusion, score test segs.
     if cfg["data"].get("seg_test_dir"):
         print(f"\nassembling test segs ({cfg['data']['seg_test_dir']}) …")
