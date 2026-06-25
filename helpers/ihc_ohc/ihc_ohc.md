@@ -654,11 +654,31 @@ model, configs and manifest are untouched. Configs:
 | geom alone | 0.974 ± 0.008 | — | — | — | — |
 | **CNN ⊕ geom (mean, calibrated)** | **0.984** | 0.986 | 0.980 | 0.988 | 0.981 |
 
-`w = 0.40` (CNN share), fused threshold 0.400; McNemar fused-vs-CNN
-p ≈ 1e-28. On par with Cunningham — the geom side (stain-agnostic
-cochlear-row geometry) transfers and refits with no surprises; the CNN had
-to relearn the egfp appearance (the deployed Cunningham CNN was degenerate
-here, predicting all-IHC). Deployed run: `runs/20260624-003309_clc-*`.
+`w = 0.40` (CNN share), fused threshold 0.400. On par with Cunningham —
+the geom side (stain-agnostic cochlear-row geometry) transfers and refits
+with no surprises; the CNN had to relearn the egfp appearance (the
+deployed Cunningham CNN was degenerate here, predicting all-IHC). Deployed
+run: `runs/20260624-003309_clc-*`.
+
+**Is fusion actually worth it? (definitive leak-free OOF, run
+`20260625-134518_clc-fuse-compare`).** The `fuse` report now emits all
+three pairwise McNemars. On CLC the **geometry is the stronger single
+model, not the CNN** — and fusion still beats it significantly:
+
+| comparison (OOF, grouped by animal) | discordant pairs | χ² | p | verdict |
+|---|---|---|---|---|
+| CNN vs geom | geom-right 385 / CNN-right 122 | 135.4 | 3e-31 | **geom ≫ CNN** |
+| fused vs geom | fused-right 68 / geom-right 11 | 39.7 | **3e-10** | **fusion > geom (real)** |
+| fused vs CNN | fused-right 375 / CNN-right 55 | 236.7 | 2e-53 | fusion ≫ CNN |
+
+So the CNN does *not* outperform — geom is ~4 pts of bal_acc ahead of it
+(0.975 vs 0.934 in that run) — yet fusion fixes 68 of geom's errors while
+losing only 11, a statistically real gain. Keeping the fusion is
+justified, but note the asymmetry: on the deployed model's *residual*
+errors (the curator's 2nd-round corrections) the CNN was right 81 % and
+geom 12 %, i.e. geom (weighted 0.6) outvoted a correct CNN — which is the
+slice the row-consistency post-pass below cleans up. (Per-run CNN variance
+shifts these by <1 pt vs the deployed run.)
 
 Three CLC-specific differences from the Cunningham flow — each is a one-
 line knob, none changes the Cunningham path:

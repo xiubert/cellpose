@@ -832,17 +832,34 @@ def fuse(cfg, *, run_dir=None):
 
     _, m_fused = report(f"FUSED ({fcfg['method']}, {tlbl})", p_fused, best_th)
     print(f"  ECE  fused {ece(p_fused, y):.4f}")
-    b, c, st, pval = mcnemar(y, np.where(pc >= 0.5, IHC, OHC),
-                             np.where(p_fused >= best_th, IHC, OHC))
-    print(f"\nMcNemar fused-vs-CNN: CNN-only-right={b}  fused-only-right={c}  "
-          f"χ²={st:.3f}  p={pval:.4g}  "
-          f"→ {'significant' if pval < 0.05 else 'not significant'} "
-          f"({'gain' if c > b else 'no gain'})")
+    # Pairwise McNemar on the OOF predictions (component-alone calls at the
+    # 0.5 argmax; fused at its tuned threshold). fused-vs-geom is the
+    # decisive "does fusion beat the *better* single model" test — geom is
+    # the stronger component here, so fused-vs-CNN overstates fusion's value.
+    cnn_pred = np.where(pc >= 0.5, IHC, OHC)
+    geom_pred = np.where(pg >= 0.5, IHC, OHC)
+    fused_pred = np.where(p_fused >= best_th, IHC, OHC)
+
+    def _mc(tag, a_lbl, predA, b_lbl, predB):
+        ba, ca, sta, pa = mcnemar(y, predA, predB)
+        verdict = ("not significant" if pa >= 0.05 else
+                   f"significant ({'gain' if ca > ba else 'no gain'})")
+        print(f"McNemar {tag}: {a_lbl}-only-right={ba}  {b_lbl}-only-right={ca}  "
+              f"χ²={sta:.3f}  p={pa:.4g}  → {verdict}")
+        return dict(a=a_lbl, b=b_lbl, a_right=ba, b_right=ca, chi2=sta, p=pa)
+
+    print()
+    mc_fc = _mc("fused-vs-CNN", "CNN", cnn_pred, "fused", fused_pred)
+    mc_fg = _mc("fused-vs-geom", "geom", geom_pred, "fused", fused_pred)
+    mc_cg = _mc("CNN-vs-geom", "CNN", cnn_pred, "geom", geom_pred)
+    b, c, st, pval = mc_fc["a_right"], mc_fc["b_right"], mc_fc["chi2"], mc_fc["p"]
 
     ckpt = dict(fuse=fused_cfg, geom_source=fcfg["geom_source"],
                 model_cfg=mcfg, k_neighbors=kN, cnn_oof=cnn_oof,
-                cnn_train=m_cnn, fused_train=m_fused, mcnemar=dict(
-                    b=b, c=c, chi2=st, p=pval),
+                cnn_train=m_cnn, fused_train=m_fused,
+                mcnemar=dict(b=b, c=c, chi2=st, p=pval),
+                mcnemar_pairs=dict(fused_vs_cnn=mc_fc, fused_vs_geom=mc_fg,
+                                   cnn_vs_geom=mc_cg),
                 calibrate=cal_method, calibrate_components=sorted(cal_set),
                 cal_cnn=cal_cnn, cal_geom=cal_geom,
                 row_consistency=fcfg.get("row_consistency"))
