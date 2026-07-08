@@ -86,9 +86,10 @@ from sklearn.model_selection import GroupKFold
 from sklearn.preprocessing import StandardScaler
 
 from ihc_ohc_crops import (
-    CLASS_NAMES, extract_cell_crop, iter_seg_files, load_image_plane,
-    load_pred, new_run_dir, resolve_class_map, resolve_training_label_map,
-    save_run_config, seg_stem, tif_for_seg, update_pred,
+    CLASS_NAMES, active_reject_ids, extract_cell_crop, iter_seg_files,
+    load_image_plane, load_pred, new_run_dir, resolve_class_map,
+    resolve_training_label_map, save_run_config, seg_stem, tif_for_seg,
+    update_pred,
 )
 from ihc_ohc_geom import (
     FEATURE_NAMES, geom_features_for_seg, load_geom_npz,
@@ -1013,7 +1014,13 @@ def _score_seg_geom(gk, fk, seg_path, *, write=False):
     kN = gk["model_cfg"]["k_neighbors"]
 
     seg = np.load(seg_path, allow_pickle=True).item()
-    cids, feats, flags, _ = geom_features_for_seg(seg, k_neighbors=kN)
+    # Option A: exclude reject-pass off-band masks from the centreline / kNN
+    # fit and from scoring, so they neither skew the geometry nor get a label.
+    excl = active_reject_ids(seg_path, seg)
+    cids, feats, flags, _ = geom_features_for_seg(
+        seg, k_neighbors=kN, exclude_ids=excl)
+    if excl:
+        print(f"  hair-cell reject: excluding {len(excl)} off-band mask(s)")
     if not cids:
         print("no instances")
         return {}

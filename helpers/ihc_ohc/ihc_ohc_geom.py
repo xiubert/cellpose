@@ -66,6 +66,8 @@ import os
 
 import numpy as np
 from scipy.spatial import ConvexHull, cKDTree
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
 from skimage.measure import regionprops_table
 
 # Reuse the crop pipeline's seg-walking / label-resolution / grouping so the
@@ -288,17 +290,25 @@ def _hull_edge_dist(xs, ys):
 
 # ── single source of truth: features for one seg ────────────────────────────────
 
-def geom_features_for_seg(seg, *, k_neighbors=6, min_cells=6):
+def geom_features_for_seg(seg, *, k_neighbors=6, min_cells=6, exclude_ids=None):
     """Per-cell geometric features for one Cellpose seg dict.
 
     Returns (cell_ids, feats (N, N_FEATURES) float32, flags (N,) int,
     centroids (N, 2) xy) for *every* instance in `masks` (inference uses
     all; the builder keeps only labelled ones). Never raises on odd input
     — degenerate images fall back to a PC1 line and are flagged.
+
+    `exclude_ids` (a set of mask ids) drops those cells *before* the
+    centreline / neighbour-graph fit — used for Option-A classification,
+    where masks the hair-cell reject pass has removed must not contaminate
+    the geometry (nor receive a label). Excluded cells are absent from every
+    returned array.
     """
     masks = seg["masks"]
     props = _shape_props(masks)
     cell_ids = sorted(props)
+    if exclude_ids:
+        cell_ids = [c for c in cell_ids if c not in exclude_ids]
     n = len(cell_ids)
     if n == 0:
         return [], np.zeros((0, N_FEATURES), np.float32), \
@@ -344,6 +354,123 @@ def geom_features_for_seg(seg, *, k_neighbors=6, min_cells=6):
 
     cents = np.column_stack([cx, cy]).astype(np.float32)
     return cell_ids, feats, flags.astype(int), cents
+
+
+# ── hair-cell mask post-processing (off-band cluster reject) ─────────────────────
+#
+# The organ of Corti is one continuous, densely-packed band of ~4 cell rows.
+# Cellpose's residual false positives on this tissue are masks segmented off
+# in a *different* structure — a strip of eGFP+ supporting cells, debris in the
+# lumen — that sit far from that band, either as isolated stragglers or as a
+# coherent satellite *cluster*. A per-cell local-density (kNN) test catches the
+# stragglers but MISSES the cluster (each member has close neighbours within the
+# cluster) and a PCA-perp test is worse still: the cluster contaminates the fit
+# and pulls the centreline toward itself. The robust discriminator is graph
+# connectivity: link cells within a few diameters, and the band is the giant
+# connected component while every off-band cluster/straggler is a separate
+# component, cleanly separated by the wide physical gap between structures.
+
+
+def band_components(cents, D, *, eps=2.5):
+    """Single-linkage connected components of the centroids.
+
+    Two cells are linked when their centroids are within `eps`·D (D = the
+    per-image median cell diameter, so the radius is scale-free). The band's
+    rows are ~1 D apart so they fuse into one giant component well below any
+    reasonable `eps`, while off-band structures sit ≳10 D away and stay
+    separate. Returns an integer component label per centroid.
+    """
+    n = len(cents)
+    if n == 0:
+        return np.zeros(0, int)
+    tree = cKDTree(cents)
+    pairs = tree.query_pairs(eps * D, output_type="ndarray")
+    if len(pairs) == 0:
+        return np.arange(n)                 # every cell isolated
+    A = csr_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])),
+                   shape=(n, n))
+    _, labels = connected_components(A + A.T, directed=False)
+    return labels
+
+
+def band_outlier_reject(cell_ids, cents, D, *, eps=2.5, min_gap=5.0,
+                        max_frac=0.4, min_cells=20):
+    """Flag masks that sit off the main organ-of-Corti band of cells.
+
+    Find the connected components of the centroid graph (`band_components`);
+    the largest is the organ-of-Corti band. A *satellite* component is
+    rejected when it is both far from the band and a clear minority:
+
+      • distance ≥ `min_gap`·D from the nearest band cell (a real detection
+        gap in a continuous band spans a few D; an off-band structure is
+        much farther), and
+      • size ≤ `max_frac`·(band size) — so a genuinely large second band
+        segment split off by an imaging gap is never deleted, only small
+        satellite clusters and stragglers.
+
+    Self-anchoring (no classifier confidence): the band defines itself as
+    the giant component, so a handful of false positives cannot move the
+    reference. One-sided by construction — cells inside the band are never
+    rejected. No-op (empty) below `min_cells`, where "the band" is undefined.
+
+    Parameters
+    ----------
+    cell_ids : list[int]      mask ids, aligned with `cents` rows.
+    cents    : (N,2) float    centroids (x, y), as from `geom_features_for_seg`.
+    D        : float          per-image median cell diameter (px).
+    eps, min_gap, max_frac, min_cells : see above.
+
+    Returns
+    -------
+    reject : dict[int, float]   {cid: distance-to-band in units of D} for
+        every rejected mask. Empty when nothing qualifies or too few cells.
+    """
+    n = len(cell_ids)
+    if n < min_cells:
+        return {}
+    cents = np.asarray(cents, float)
+    labels = band_components(cents, D, eps=eps)
+    sizes = np.bincount(labels)
+    main = int(np.argmax(sizes))
+    main_pts = cents[labels == main]
+    if len(main_pts) < min_cells:           # no dominant band → don't guess
+        return {}
+    mtree = cKDTree(main_pts)
+    d_to_band, _ = mtree.query(cents)       # px; band cells → ~0
+    reject = {}
+    for comp in np.unique(labels):
+        if comp == main:
+            continue
+        idx = np.nonzero(labels == comp)[0]
+        if sizes[comp] > max_frac * sizes[main]:
+            continue                        # too big to be a satellite
+        gap = float(d_to_band[idx].min()) / D
+        if gap < min_gap:
+            continue                        # close enough to be a band gap
+        for i in idx:
+            reject[int(cell_ids[i])] = float(d_to_band[i] / D)
+    return reject
+
+
+def reject_for_seg(seg, *, eps=2.5, min_gap=5.0, max_frac=0.4, min_cells=20,
+                   k_neighbors=6):
+    """Convenience: off-band reject set for one Cellpose seg dict.
+
+    Computes geom features (for centroids + the per-image scale D) then
+    `band_outlier_reject`. Returns {cid: dist-to-band in D}. Used by the GUI
+    post-process button, the pipeline, and the `clc_reject_eval` validation
+    harness so all three flag identically.
+    """
+    cell_ids, _feats, _flags, cents = geom_features_for_seg(
+        seg, k_neighbors=k_neighbors)
+    if len(cell_ids) == 0:
+        return {}
+    # D = per-image median equivalent diameter, recomputed from the props the
+    # feature builder already used (kept local so this stays a pure geom call).
+    props = _shape_props(seg["masks"])
+    D = float(np.median([props[c]["eqdiam"] for c in cell_ids])) or 1.0
+    return band_outlier_reject(cell_ids, cents, D, eps=eps, min_gap=min_gap,
+                               max_frac=max_frac, min_cells=min_cells)
 
 
 # ── dataset builder ─────────────────────────────────────────────────────────────

@@ -771,6 +771,70 @@ Deployed CLC config ships the conservative 0-break point
 any other dataset are unaffected unless they opt in. The remaining ~28
 higher-confidence errors are not safely auto-correctable and stay manual.
 
+## Hair-cell mask post-processing (off-band false-positive reject)
+
+The row-consistency pass fixes *classification* errors; this pass fixes
+*segmentation* false positives. On a **new** image, Cellpose sometimes
+segments masks off in a neighbouring structure — a strip of eGFP+
+supporting cells, debris in the lumen — that are not hair cells. These sit
+far from the single continuous organ-of-Corti band, either as isolated
+stragglers or as a coherent **satellite cluster**. The user's phrasing:
+"if masks are labelled far from the main rows of cells, delete them."
+
+**Mechanism — connected components, not local density.** A per-cell kNN
+isolation test catches stragglers but misses a cluster (each member has
+close neighbours *within* the cluster); a PCA-perp test is worse still (the
+cluster contaminates the centreline fit and pulls it toward itself, so the
+off-band cells read as on-band). The robust discriminator is graph
+connectivity: link cells whose centroids are within `eps`·D (D = per-image
+median cell diameter), and the band — whose ~4 rows are ≈1 D apart — fuses
+into one giant connected component while every off-band structure, ≳10 D
+away, is a separate component. `band_outlier_reject` (in `ihc_ohc_geom.py`,
+torch-free) rejects a satellite component when it is both **far**
+(≥`min_gap`·D from the band) and a **clear minority** (≤`max_frac`× the band
+size — so a real second band segment split off by an imaging gap is never
+deleted). Self-anchoring: the band defines itself as the giant component, so
+false positives can't move the reference.
+
+**Operating point, validated like row-consistency.** `clc_reject_eval.py`
+runs the pass over the 67-image CLC set. Two reads:
+
+| | gap3 | **gap5 (default)** | gap8 |
+|---|---|---|---|
+| false deletions on curated GT (of 9757 real cells) | 652 (6.7 %) | **3 (0.03 %)** | 3 (0.03 %) |
+| TP-loss on 9237 model detections | 527 (5.7 %) | **0** | 0 |
+
+There is a hard safety **cliff at gap 3→4**: at 3 D a real detection-gap in
+the band splits it and the smaller piece is dropped (e.g. neonate sample 2's
+39-cell segment); at ≥4 D that never happens. The deployed default is
+`eps 2.5 / min_gap 5 / max_frac 0.4` — comfortably past the cliff, 0 real
+detections lost, and it removes the full 18-cell eGFP-tissue cluster + a
+straggler on the `63x 3L 16khz` deploy test image.
+
+**Scope / honest ceiling.** In-sample FP-catch is ≈0 (0–1 of 327 model FPs):
+on training-domain images the fine-tuned model already produces almost no
+*distant* off-band FPs (its residual FPs are near-band over-segmentations,
+which this pass deliberately does **not** touch — see the FN/merging
+analysis). The value is a **deployment safety net for new images** where the
+model over-segments surrounding tissue.
+
+**GUI + sidecar, Option A.** Flags live in the `_pred.npy` sidecar
+(`mask_reject` {cid→dist-to-band}, `mask_reject_applied` bool) — the dataset
+seg is never mutated. The GUI's **"hair cell post-processing"** panel (above
+the cell-type classifier) is **standalone**: *run* is enabled for any 2D
+masks — no cell-type manifest needed — and flags off-band masks with the
+locked defaults; if a cell-type manifest with a `hair_cell_postprocess:`
+block *is* selected, its params override those defaults. The *apply*/*disable*
+toggle **hides** flagged masks non-destructively (zeroes their alpha in
+`draw_layer`; ids preserved, no `remove_cell` renumber) and can restore them;
+the reject set (and applied state) round-trips through the sidecar so a
+re-opened image comes back flagged/hidden. When applied, the IHC/OHC
+classifier **excludes** the rejected masks (`active_reject_ids` →
+`exclude_ids`): they neither skew the centreline/kNN geometry nor receive a
+label (Option A). Aggregate analyses honour `mask_reject` only when
+`mask_reject_applied`. The pipeline/config side stays **off by default**
+(Cunningham unaffected); the manifest block is opt-in param tuning only.
+
 ---
 
 # Evaluation caveats & known limitations

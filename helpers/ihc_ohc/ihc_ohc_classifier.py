@@ -66,8 +66,8 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision.transforms import functional as TF
 
 from ihc_ohc_crops import (
-    CLASS_NAMES, extract_cell_crop, load_image_plane, new_run_dir,
-    resolve_class_map, save_run_config, tif_for_seg, update_pred,
+    CLASS_NAMES, active_reject_ids, extract_cell_crop, load_image_plane,
+    new_run_dir, resolve_class_map, save_run_config, tif_for_seg, update_pred,
 )
 
 
@@ -703,6 +703,11 @@ def predict_seg(ckpt_path, seg_path, *, write=False, device=None):
     fill = float(plane.mean())
 
     ids = [int(i) for i in np.unique(masks) if i != 0]
+    # Option A: don't classify masks the hair-cell reject pass has removed.
+    excl = active_reject_ids(seg_path, seg)
+    if excl:
+        ids = [i for i in ids if i not in excl]
+        print(f"  hair-cell reject: excluding {len(excl)} off-band mask(s)")
     crops, valid = [], []
     for cid in ids:
         crop = extract_cell_crop(plane, masks, cid, out_size=out_size,

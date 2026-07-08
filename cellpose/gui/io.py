@@ -473,6 +473,10 @@ def _masks_to_gui(parent, masks, outlines=None, colors=None):
     print("GUI_INFO: creating cellcolors and drawing masks")
     parent.cellcolors = np.concatenate((np.array([[255, 255, 255]]), colors),
                                        axis=0).astype(np.uint8)
+    # Reset (and restore from sidecar) the hair-cell reject state for this
+    # image before drawing, so a re-opened applied reject hides on first paint.
+    if hasattr(parent, "reset_hcpp_state"):
+        parent.reset_hcpp_state()
     if parent.ncells > 0:
         parent.draw_layer()
         parent.toggle_mask_ops()

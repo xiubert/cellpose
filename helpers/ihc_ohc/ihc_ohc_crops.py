@@ -200,6 +200,57 @@ def update_pred(seg_path, **new_keys):
     return pp
 
 
+# ── hair-cell mask post-process reject (sidecar state) ──────────────────────────
+#
+# Two sidecar keys, both written via update_pred so the dataset seg is never
+# touched (same discipline as class_map_*):
+#   mask_reject          {cid: score}  — audit record of what the off-band
+#                        reject pass flagged; written every time it runs.
+#   mask_reject_applied  bool          — whether the user has endorsed the
+#                        rejection (masks hidden / excluded). Downstream honours
+#                        the flags ONLY when this is True, so the reject list can
+#                        be inspected without affecting counts until applied.
+
+def load_reject(seg_path, seg=None):
+    """(reject: dict[int, float], applied: bool) from the sidecar.
+
+    `reject` is the flagged {cid → distance-to-band}; `applied` is the user's
+    endorsement. Both empty/False when the pass has never run.
+    """
+    pred = load_pred(seg_path, seg)
+    rej = {int(k): float(v) for k, v in (pred.get("mask_reject") or {}).items()}
+    return rej, bool(pred.get("mask_reject_applied", False))
+
+
+def set_reject(seg_path, reject):
+    """Persist a freshly-computed reject set; resets `applied` → False.
+
+    Re-running the post-process supersedes any prior flags and un-applies
+    them, so the user must explicitly re-apply — a recompute never silently
+    hides masks.
+    """
+    rej = {int(k): float(v) for k, v in (reject or {}).items()}
+    update_pred(seg_path, mask_reject=rej, mask_reject_applied=False)
+    return rej
+
+
+def set_reject_applied(seg_path, applied):
+    """Set the endorsement flag (GUI apply/disable toggle)."""
+    update_pred(seg_path, mask_reject_applied=bool(applied))
+    return bool(applied)
+
+
+def active_reject_ids(seg_path, seg=None):
+    """Set of cids to treat as removed = flagged AND applied (else empty).
+
+    The single source of truth for "which masks are off" — the classifier
+    excludes these from its fit/scoring (Option A) and aggregate analyses
+    drop them from counts.
+    """
+    rej, applied = load_reject(seg_path, seg)
+    return set(rej) if applied else set()
+
+
 # ── run-artifact organisation ──────────────────────────────────────────────────
 
 # Every train/sweep/fuse invocation gets its own timestamped subdir under the

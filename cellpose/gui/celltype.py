@@ -211,22 +211,34 @@ def run_celltype(manifest, seg_path):
     if fuse and not geom:
         raise RuntimeError("manifest sets fuse_ckpt but no geom_ckpt")
 
-    # Snapshot user labels, then atomically replace the sidecar with
-    # just those — so stale predictions can't linger AND a predict
-    # crash can't lose user work.
+    # Snapshot the keys that must survive a re-predict — user labels AND the
+    # hair-cell reject state — then atomically replace the sidecar with just
+    # those. This clears stale predictions keyed to a prior mask numbering
+    # while (a) never losing user work to a predict crash and (b) preserving
+    # the reject set so Option-A classification still excludes the off-band
+    # masks the reject pass applied before this run.
     pp = pred_path(seg_path)
     user_labels = {}
+    keep = {}
     if os.path.exists(pp):
         try:
             cur = np.load(pp, allow_pickle=True).item() or {}
             user_labels = {int(k): str(v)
                            for k, v in (cur.get("class_map_user") or {}).items()}
+            reject = {int(k): float(v)
+                      for k, v in (cur.get("mask_reject") or {}).items()}
+            if reject:
+                keep["mask_reject"] = reject
+                keep["mask_reject_applied"] = bool(
+                    cur.get("mask_reject_applied", False))
         except Exception:  # noqa: BLE001
             user_labels = {}
     if user_labels:
+        keep["class_map_user"] = user_labels
+    if keep:
         tmp = pp + ".tmp"
         with open(tmp, "wb") as fh:
-            np.save(fh, {"class_map_user": user_labels}, allow_pickle=True)
+            np.save(fh, keep, allow_pickle=True)
         os.replace(tmp, pp)
     elif os.path.exists(pp):
         try:
@@ -281,3 +293,64 @@ def get_user_labels(seg_path):
     from ihc_ohc_crops import load_pred  # type: ignore
     pred = load_pred(seg_path)
     return {int(k): str(v) for k, v in (pred.get("class_map_user") or {}).items()}
+
+
+# ── hair-cell mask post-processing (off-band reject) ────────────────────────────
+
+# Default reject parameters, locked on the CLC validation (link cells within
+# 2.5·D, reject an off-band cluster ≥5·D from the band that is ≤0.4× its size):
+# 0.03% false deletions across 67 GT images, 0 real detections lost on 9k+ model
+# predictions. A manifest's `hair_cell_postprocess:` block overrides any of these.
+_REJECT_DEFAULTS = {"eps": 2.5, "min_gap": 5.0, "max_frac": 0.4, "min_cells": 20}
+
+
+def postprocess_params(manifest):
+    """Reject kwargs for a manifest, or None if it doesn't enable the pass.
+
+    The panel is hair-cell-specific: it activates only for a manifest that
+    declares a `hair_cell_postprocess:` block (which may be empty → all
+    defaults, or override individual params).
+    """
+    if "hair_cell_postprocess" not in manifest:
+        return None                      # key absent → panel disabled
+    block = manifest.get("hair_cell_postprocess")   # may be None (bare key)
+    params = dict(_REJECT_DEFAULTS)
+    if isinstance(block, dict):
+        for k in _REJECT_DEFAULTS:
+            if k in block:
+                params[k] = block[k]
+    return params
+
+
+def run_hair_cell_postprocess(seg_path, params=None):
+    """Flag off-band masks for one seg; write the reject set to the sidecar.
+
+    Computes the connected-component off-band reject (`reject_for_seg`) over
+    every mask, persists it as `mask_reject` with `mask_reject_applied` reset
+    to False (computing never hides masks — the GUI toggle endorses that
+    separately). `params` overrides the locked defaults (`_REJECT_DEFAULTS`);
+    None uses them — so this works standalone after segmentation, no cell-type
+    manifest required. Returns (reject: dict[int, float], applied: bool).
+    """
+    _ensure_helpers_on_path()
+    from ihc_ohc_geom import reject_for_seg  # type: ignore
+    from ihc_ohc_crops import set_reject, load_reject  # type: ignore
+    params = dict(_REJECT_DEFAULTS) if params is None else params
+    seg = np.load(seg_path, allow_pickle=True).item()
+    reject = reject_for_seg(seg, **params)
+    set_reject(seg_path, reject)
+    return load_reject(seg_path)
+
+
+def get_reject(seg_path):
+    """(reject: dict[int, float], applied: bool) from the sidecar."""
+    _ensure_helpers_on_path()
+    from ihc_ohc_crops import load_reject  # type: ignore
+    return load_reject(seg_path)
+
+
+def set_reject_applied(seg_path, applied):
+    """Persist the apply/disable endorsement (True = masks hidden)."""
+    _ensure_helpers_on_path()
+    from ihc_ohc_crops import set_reject_applied as _sra  # type: ignore
+    return _sra(seg_path, applied)

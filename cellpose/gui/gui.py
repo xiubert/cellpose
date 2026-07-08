@@ -566,6 +566,55 @@ class MainW(QMainWindow):
 
 
         b += 1
+        # Hair-cell-specific mask post-processing: flag masks segmented far
+        # from the main organ-of-Corti rows of cells (false positives on
+        # surrounding tissue) and hide them non-destructively. Placed above
+        # the cell-type classifier because it runs first in the workflow —
+        # classification then scores only the surviving masks (Option A).
+        # Uses the manifest selected in the cell-type dropdown below; only
+        # manifests that declare a `hair_cell_postprocess:` block enable it.
+        self.hcppBox = QGroupBox("hair cell post-processing")
+        self.hcppBox.setFont(self.boldfont)
+        self.hcppBoxG = QGridLayout()
+        self.hcppBox.setLayout(self.hcppBoxG)
+        self.l0.addWidget(self.hcppBox, b, 0, 1, 9)
+
+        self.HcppStatus = QLabel("flag off-band masks")
+        self.HcppStatus.setFont(self.medfont)
+        self.HcppStatus.setToolTip(
+            "delete masks segmented far from the main hair-cell rows "
+            "(e.g. false positives on surrounding tissue)")
+        self.hcppBoxG.addWidget(self.HcppStatus, 0, 0, 1, 6)
+
+        self.HcppRunButton = QPushButton(u"run")
+        self.HcppRunButton.setFont(self.medfont)
+        self.HcppRunButton.setFixedWidth(35)
+        self.HcppRunButton.setToolTip(
+            "flag masks far from the main organ-of-Corti band "
+            "(written to <stem>_pred.npy as mask_reject)")
+        self.HcppRunButton.clicked.connect(self.compute_hair_cell_postprocess)
+        self.hcppBoxG.addWidget(self.HcppRunButton, 0, 6, 1, 1)
+        self.HcppRunButton.setEnabled(False)
+
+        self.HcppApplyButton = QPushButton(u"apply")
+        self.HcppApplyButton.setFont(self.medfont)
+        self.HcppApplyButton.setFixedWidth(55)
+        self.HcppApplyButton.setToolTip(
+            "apply: hide flagged masks (kept in the file, reversible); "
+            "disable: show them again")
+        self.HcppApplyButton.clicked.connect(self.toggle_hair_cell_apply)
+        self.hcppBoxG.addWidget(self.HcppApplyButton, 0, 7, 1, 2)
+        self.HcppApplyButton.setEnabled(False)
+
+        # Reject state (per loaded image): flagged {cid: score}, whether the
+        # user has applied (hidden) them, and the set currently hidden from
+        # the view (read by draw_layer to zero their alpha).
+        self.hcpp_reject = {}
+        self.hcpp_applied = False
+        self.hcpp_hidden = set()
+
+
+        b += 1
         self.celltypeBox = QGroupBox("cell-type classifier")
         self.celltypeBoxG = QGridLayout()
         self.celltypeBox.setLayout(self.celltypeBoxG)
@@ -628,6 +677,11 @@ class MainW(QMainWindow):
 
         self.CelltypeChooseC.currentIndexChanged.connect(
             self._update_celltype_legend)
+        # The hair-cell panel shares this dropdown — refresh its buttons when
+        # the selected manifest changes (only signal-driven, so it never fires
+        # before init completes).
+        self.CelltypeChooseC.currentIndexChanged.connect(
+            self._update_hcpp_buttons)
         self._update_celltype_legend()
 
         # Labeling-mode state — toggled by toggle_celltype_labeling, read
@@ -847,6 +901,7 @@ class MainW(QMainWindow):
         ct_ready = len(self.celltype_strings) > 0 and self.ncells.get() > 0
         self.CelltypeButtonC.setEnabled(ct_ready and not self.labeling_celltype)
         self.CelltypeLabelButtonC.setEnabled(ct_ready)
+        self._update_hcpp_buttons()
         for i in range(len(self.StyleButtons)):
             self.StyleButtons[i].setEnabled(True)
 
@@ -928,6 +983,7 @@ class MainW(QMainWindow):
         ct_ready = has_cells and len(self.celltype_strings) > 0
         self.CelltypeButtonC.setEnabled(ct_ready and not self.labeling_celltype)
         self.CelltypeLabelButtonC.setEnabled(ct_ready)
+        self._update_hcpp_buttons()
 
     def remove_action(self):
         if self.selected > 0:
@@ -1692,6 +1748,16 @@ class MainW(QMainWindow):
             self.layerz[self.outpix[self.currentZ] > 0] = np.array(
                 self.outcolor).astype(np.uint8)
 
+        # Hair-cell post-processing: hide applied off-band masks without
+        # deleting them — zero the fill (and outline) alpha for their pixels.
+        # Reversible: clearing self.hcpp_hidden restores them on next redraw,
+        # cell ids untouched (no renumber, unlike remove_cell).
+        if getattr(self, "hcpp_hidden", None):
+            hidden = np.array(sorted(self.hcpp_hidden))
+            self.layerz[np.isin(self.cellpix[self.currentZ], hidden)] = 0
+            if self.outlinesOn:
+                self.layerz[np.isin(self.outpix[self.currentZ], hidden)] = 0
+
 
     def set_normalize_params(self, normalize_params):
         from cellpose.models import normalize_default
@@ -2167,38 +2233,9 @@ class MainW(QMainWindow):
             print(f"ERROR: cannot load manifest {manifest_path}: {e}")
             return
 
-        # The classifier reads masks from disk. If a seg exists, refuse to
-        # run on stale state — re-saving here would clobber extras like the
-        # ground-truth `class_map` key (label_xfer.py writes that, and
-        # io._save_sets only persists a fixed key set). If no seg exists
-        # yet (e.g. fresh cpsam run), save once so there's a file to read.
-        seg_path = os.path.splitext(self.filename)[0] + "_seg.npy"
-        gui_masks = np.asarray(self.cellpix).squeeze()
-        if not os.path.exists(seg_path):
-            io._save_sets(self)
-        else:
-            try:
-                disk = np.load(seg_path, allow_pickle=True).item()
-            except Exception as e:  # noqa: BLE001
-                print(f"ERROR: cannot read {seg_path}: {e}")
-                return
-            disk_masks = np.asarray(disk.get("masks")).squeeze()
-            if disk_masks.shape != gui_masks.shape or not np.array_equal(
-                    disk_masks, gui_masks):
-                msg = ("ERROR: on-disk masks differ from GUI state — "
-                       "save masks (Ctrl+S) before running the celltype model")
-                if "class_map" in disk:
-                    # io._save_sets writes a fixed key set that does NOT
-                    # include class_map, so Ctrl+S would silently lose the
-                    # ground-truth labels in this seg. Tell the user so they
-                    # can back up the file first.
-                    msg += ("\n  WARNING: this seg contains a ground-truth "
-                            "`class_map` key. io._save_sets does NOT persist "
-                            "it, so saving will drop the GT labels — back up "
-                            f"{os.path.basename(seg_path)} first if you need "
-                            "to keep them.")
-                print(msg)
-                return
+        seg_path = self._prepare_seg_for_disk_read()
+        if seg_path is None:
+            return
 
         self.progress.setValue(10)
         try:
@@ -2236,6 +2273,182 @@ class MainW(QMainWindow):
         summary = "  ".join(f"{k} {v}" for k, v in sorted(counts.items()))
         print(f"GUI_INFO: celltype [{manifest.get('name')}] → "
               f"{summary}  (source: {source}, recolored {n_recolored}/{ncells})")
+
+    def _prepare_seg_for_disk_read(self):
+        """Ensure <stem>_seg.npy on disk matches GUI masks; return path or None.
+
+        Shared by the cell-type classifier and hair-cell post-processing —
+        both read masks from disk, so the on-disk numbering must match the GUI
+        state. If no seg exists yet (e.g. a fresh cpsam run) save one; if one
+        exists but differs, refuse (re-saving here would clobber extras like
+        the ground-truth `class_map` key that io._save_sets doesn't persist).
+        Prints the reason and returns None on refusal/error.
+        """
+        seg_path = os.path.splitext(self.filename)[0] + "_seg.npy"
+        gui_masks = np.asarray(self.cellpix).squeeze()
+        if not os.path.exists(seg_path):
+            io._save_sets(self)
+            return seg_path
+        try:
+            disk = np.load(seg_path, allow_pickle=True).item()
+        except Exception as e:  # noqa: BLE001
+            print(f"ERROR: cannot read {seg_path}: {e}")
+            return None
+        disk_masks = np.asarray(disk.get("masks")).squeeze()
+        if disk_masks.shape != gui_masks.shape or not np.array_equal(
+                disk_masks, gui_masks):
+            msg = ("ERROR: on-disk masks differ from GUI state — "
+                   "save masks (Ctrl+S) before running")
+            if "class_map" in disk:
+                # io._save_sets writes a fixed key set that does NOT include
+                # class_map, so Ctrl+S would silently lose the ground-truth
+                # labels in this seg. Warn so the user can back it up first.
+                msg += ("\n  WARNING: this seg contains a ground-truth "
+                        "`class_map` key. io._save_sets does NOT persist it, "
+                        "so saving will drop the GT labels — back up "
+                        f"{os.path.basename(seg_path)} first if you need them.")
+            print(msg)
+            return None
+        return seg_path
+
+    def _hcpp_manifest(self):
+        """Selected cell-type manifest if it enables hair-cell post-processing.
+
+        Returns the loaded manifest dict when it declares a
+        `hair_cell_postprocess:` block, else None (also None if no manifest is
+        selected or PyYAML isn't installed). The panel drives off the same
+        dropdown as the cell-type classifier, so no separate registration.
+        """
+        idx = self.CelltypeChooseC.currentIndex()
+        if idx <= 0 or idx > len(self.celltype_strings):
+            return None
+        try:
+            manifest = celltype.load_manifest(self.celltype_strings[idx - 1])
+        except Exception:  # noqa: BLE001
+            return None
+        return manifest if celltype.postprocess_params(manifest) is not None \
+            else None
+
+    def _update_hcpp_buttons(self):
+        """Enable run for any 2D masks (post-processing is standalone — it
+        needs no cell-type manifest); enable apply once a reject set exists."""
+        ready = self.ncells.get() > 0 and self.NZ == 1
+        self.HcppRunButton.setEnabled(ready)
+        self.HcppApplyButton.setEnabled(len(self.hcpp_reject) > 0)
+
+    def reset_hcpp_state(self):
+        """Reset the per-image reject state, restoring any persisted flags.
+
+        Called from io._masks_to_gui whenever masks enter the GUI, so flags
+        never carry across images, and a re-opened image that already has a
+        `mask_reject` sidecar comes back with its flags (and hidden state, if
+        it was applied). Guarded so the early-init reset() call — before the
+        panel widgets exist — is a no-op.
+        """
+        if not hasattr(self, "HcppRunButton"):
+            return
+        self.hcpp_reject = {}
+        self.hcpp_applied = False
+        self.hcpp_hidden = set()
+        fn = getattr(self, "filename", None)
+        if fn:
+            seg_path = os.path.splitext(fn)[0] + "_seg.npy"
+            if os.path.exists(seg_path):
+                try:
+                    reject, applied = celltype.get_reject(seg_path)
+                except Exception:  # noqa: BLE001
+                    reject, applied = {}, False
+                if reject:
+                    self.hcpp_reject = {int(c): float(s)
+                                        for c, s in reject.items()}
+                    if applied:
+                        self.hcpp_applied = True
+                        self.hcpp_hidden = set(self.hcpp_reject)
+        n = len(self.hcpp_reject)
+        self.HcppStatus.setText(f"{n} off-band mask(s) flagged" if n
+                                else "flag off-band masks")
+        self.HcppApplyButton.setText(
+            "disable" if self.hcpp_applied else "apply")
+        self.HcppApplyButton.setStyleSheet(
+            self.stylePressed if self.hcpp_applied else self.styleUnpressed)
+        self._update_hcpp_buttons()
+
+    def compute_hair_cell_postprocess(self):
+        """Flag masks segmented far from the main hair-cell rows.
+
+        Runs the connected-component off-band reject over the current image's
+        masks and stores the result in <stem>_pred.npy (mask_reject). Does NOT
+        hide anything — the user reviews the count, then clicks apply. Works
+        standalone (no cell-type manifest needed); if a manifest with a
+        `hair_cell_postprocess:` block is selected, its params override the
+        locked defaults.
+        """
+        if not self.filename:
+            print("ERROR: no image loaded")
+            return
+        if self.NZ != 1:
+            print("ERROR: hair-cell post-processing is 2D-only; image is 3D")
+            return
+        if self.ncells.get() == 0:
+            print("ERROR: no masks — segment or load masks first")
+            return
+        seg_path = self._prepare_seg_for_disk_read()
+        if seg_path is None:
+            return
+
+        # Params from the selected cell-type manifest's block if one is chosen
+        # and declares it; otherwise the locked defaults.
+        manifest = self._hcpp_manifest()
+        params = celltype.postprocess_params(manifest) if manifest else None
+        src = f" [{manifest.get('name')}]" if manifest else ""
+        # A fresh reject supersedes any prior applied state — un-hide first so
+        # the view/state can't get out of sync with the new flag set.
+        if self.hcpp_applied:
+            self._apply_hcpp(False, seg_path)
+        try:
+            reject, _applied = celltype.run_hair_cell_postprocess(
+                seg_path, params)
+        except Exception as e:  # noqa: BLE001
+            print(f"ERROR: hair-cell post-processing failed: {e}")
+            return
+        self.hcpp_reject = {int(c): float(s) for c, s in reject.items()}
+        n = len(self.hcpp_reject)
+        self.HcppStatus.setText(f"{n} off-band mask(s) flagged"
+                                if n else "no off-band masks")
+        self.HcppApplyButton.setText("apply")
+        self.HcppApplyButton.setStyleSheet(self.styleUnpressed)
+        self._update_hcpp_buttons()
+        print(f"GUI_INFO: hair-cell post-processing{src} → flagged {n} "
+              f"off-band mask(s) (ids: {sorted(self.hcpp_reject)[:20]}"
+              f"{'…' if n > 20 else ''})")
+
+    def toggle_hair_cell_apply(self):
+        """Toggle hiding of the flagged off-band masks (non-destructive)."""
+        if not self.hcpp_reject:
+            print("ERROR: run hair-cell post-processing first")
+            return
+        seg_path = os.path.splitext(self.filename)[0] + "_seg.npy"
+        self._apply_hcpp(not self.hcpp_applied, seg_path)
+
+    def _apply_hcpp(self, applied, seg_path):
+        """Hide (applied=True) or show (False) the flagged masks and persist
+        the endorsement to the sidecar. Masks are never deleted — hiding
+        zeroes their alpha in draw_layer, so disable restores them exactly,
+        cell ids and all."""
+        self.hcpp_applied = bool(applied)
+        self.hcpp_hidden = set(self.hcpp_reject) if applied else set()
+        try:
+            celltype.set_reject_applied(seg_path, applied)
+        except Exception as e:  # noqa: BLE001
+            print(f"WARNING: could not persist reject state: {e}")
+        self.HcppApplyButton.setText("disable" if applied else "apply")
+        self.HcppApplyButton.setStyleSheet(
+            self.stylePressed if applied else self.styleUnpressed)
+        self.draw_layer()
+        self.update_layer()
+        verb = "hid" if applied else "restored"
+        print(f"GUI_INFO: hair-cell post-processing {verb} "
+              f"{len(self.hcpp_reject)} off-band mask(s)")
 
     def new_model(self):
         if self.NZ != 1:

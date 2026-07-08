@@ -21,3 +21,18 @@ fuse_ckpt: runs/20260624-003309_clc-fuse/fuse.pkl
 classes:
   IHC: [232, 38, 220]   # magenta
   OHC: [40, 220, 230]   # cyan
+
+# Enables the GUI's "hair cell post-processing" panel: flags masks segmented
+# far from the main organ-of-Corti band (false positives on surrounding
+# eGFP+ tissue) so they can be hidden. Operating point locked on the CLC
+# validation (link 2.5·D, reject an off-band cluster ≥5·D from the band that
+# is ≤0.4× its size): 0.03% false deletions across 67 GT images, 0 real
+# detections lost on 9k+ model predictions. Omit the block (as the Cunningham
+# manifest does) to leave the panel disabled. Bare `hair_cell_postprocess:`
+# uses these defaults; override any of eps / min_gap / max_frac / min_cells.
+hair_cell_postprocess:
+  eps: 2.5        # link cells within eps·D (D = per-image median diameter)
+  min_gap: 5.0    # reject only clusters ≥ this many D from the band
+  max_frac: 0.4   # …and no larger than this fraction of the band (protects
+                  # a real second band segment split off by an imaging gap)
+  min_cells: 20   # below this, "the band" is undefined → no-op
