@@ -74,10 +74,23 @@ def best_iou_to_gt(pred_bin, gt):
     return (pred_bin & gm).sum() / (pred_bin | gm).sum()
 
 
+_MODEL_CACHE = {"path": None, "model": None}
+
+
 def run_model(path, img):
-    m = cpmodels.CellposeModel(gpu=True, pretrained_model=path)
+    """Segment one image, reusing the last-loaded model.
+
+    A cpsam checkpoint is ~1.2 GB and takes ~10 s to instantiate, so building a
+    fresh CellposeModel per image dominated the runtime (n_images x n_model_specs
+    loads). A ONE-entry cache is enough because main() orders the images by fold,
+    so each held-out fold model is loaded once; a bigger cache would just pin
+    several GB of GPU memory. Predictions are unchanged.
+    """
+    if _MODEL_CACHE["path"] != path:
+        _MODEL_CACHE["model"] = cpmodels.CellposeModel(gpu=True, pretrained_model=path)
+        _MODEL_CACHE["path"] = path
     ca = 2 if (img.ndim == 3) else None
-    return m.eval(img, channel_axis=ca, normalize=True)[0].astype(np.int32)
+    return _MODEL_CACHE["model"].eval(img, channel_axis=ca, normalize=True)[0].astype(np.int32)
 
 
 def fold_for_animal(manifest, animal):
@@ -121,6 +134,12 @@ def main():
         data.append(dict(sp=sp, img=img, masks=masks, animal=animal,
                          tp=tp_labels, fn=fn_labels, cp=cp, fp=fp_masks))
         print(f"  {os.path.basename(sp)[:42]:42s} animal={animal:6s} TP={len(tp_labels):3d} FN={len(fn_labels):2d} FP(cpsam)={len(fp_masks):3d}", flush=True)
+
+    # Group images by held-out fold so the one-entry model cache in run_model()
+    # loads each fold checkpoint once instead of once per image. Every metric
+    # below is a mean over per-cell booleans, so image order does not affect it.
+    data.sort(key=lambda d: (fold_for_animal(manifest, d["animal"]) is None,
+                             fold_for_animal(manifest, d["animal"]) or 0, d["sp"]))
 
     model_specs = [m.strip() for m in args.models.split(",") if m.strip()]
 

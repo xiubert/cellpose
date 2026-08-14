@@ -39,8 +39,12 @@ import re
 import numpy as np
 
 _AUG_MARKERS = ("_SV_", "_rot90", "_rot180", "_rot270", "_fliph", "_flipv")
-# animal id token: digits optionally followed by L/R (5042L, 5165, 1L, 2L, ...)
-_ANIMAL_RE = re.compile(r"^\d+[LR]?$")
+# animal id token, either
+#   numeric  : digits optionally followed by L/R  (5042L, 5165, 1L, 2L, 8363)
+#   lettered : 1-3 capitals ending in L/R         (AL, BL, CL, DL — the 2026-07 batch)
+# The lettered form needs >=2 chars so a stray "L" token can't match, and the
+# trailing L/R keeps it from matching things like "HET" or "SV".
+_ANIMAL_RE = re.compile(r"^(?:\d+[LR]?|[A-Z]{1,2}[LR])$")
 # frequency anchor: "8khz", "16 khz", "32khz " ...
 _FREQ_RE = re.compile(r"(\d+)\s*khz", re.IGNORECASE)
 
@@ -83,14 +87,50 @@ def scan(root, subdirs):
     return items
 
 
-def make_folds(items, scheme, n_folds, seed):
+def _extend_groups(animals, names, prior_path):
+    """Keep a previous manifest's fold assignment; add only the NEW animals.
+
+    WHY: when new labeled data arrives, re-running the split from scratch
+    reshuffles every animal, which makes the new CV run un-paired with the
+    previous one — you can no longer tell "more data helped" apart from "the
+    test sets changed". Extending pins each already-assigned animal to its old
+    fold, so previously trained fold models stay valid held-out scorers for the
+    same images, and new animals are added where they balance the folds best
+    (greedy: biggest animal first -> fold with the fewest images).
+    """
+    with open(prior_path) as fh:
+        prior = json.load(fh)
+    groups = [list(f["test_animals"]) for f in prior["folds"]]
+    known = {a for g in groups for a in g}
+    counts = [sum(len(animals[a]["idx"]) for a in g if a in animals) for g in groups]
+
+    missing = sorted(known - set(names))
+    new = sorted(set(names) - known, key=lambda a: (-len(animals[a]["idx"]), a))
+    for a in new:
+        k = int(np.argmin(counts))
+        groups[k].append(a)
+        counts[k] += len(animals[a]["idx"])
+    return groups, prior, new, missing
+
+
+def make_folds(items, scheme, n_folds, seed, extend=None):
     # animal -> age, and animal -> list of item indices
     animals = {}
     for i, it in enumerate(items):
         animals.setdefault(it["animal"], {"age": it["age"], "idx": []})["idx"].append(i)
     names = sorted(animals)
+    extend_info = None
 
-    if scheme == "loao":
+    if extend:
+        groups, prior, new, missing = _extend_groups(animals, names, extend)
+        extend_info = {"prior": extend, "prior_folds": prior["n_folds"],
+                       "new_animals": new, "missing_from_prior": missing}
+        if missing:
+            print(f"WARNING: {len(missing)} animal(s) in the prior manifest are absent "
+                  f"from this root: {missing}")
+        print(f"extending {extend}: {len(names) - len(new)} animals keep their fold, "
+              f"{len(new)} new animal(s) assigned: {new}")
+    elif scheme == "loao":
         groups = [[a] for a in names]                      # one animal per fold
     else:
         rng = np.random.default_rng(seed)
@@ -105,7 +145,7 @@ def make_folds(items, scheme, n_folds, seed):
     folds = []
     for k, test_animals in enumerate(groups):
         test_set = set(test_animals)
-        test_idx = [i for a in test_animals for i in animals[a]["idx"]]
+        test_idx = [i for a in test_animals if a in animals for i in animals[a]["idx"]]
         train_idx = [i for i in range(len(items)) if items[i]["animal"] not in test_set]
         folds.append({
             "fold": k,
@@ -113,7 +153,7 @@ def make_folds(items, scheme, n_folds, seed):
             "train": [items[i]["stem"] for i in sorted(train_idx)],
             "test":  [items[i]["stem"] for i in sorted(test_idx)],
         })
-    return folds, animals
+    return folds, animals, extend_info
 
 
 def parse_args():
@@ -123,6 +163,10 @@ def parse_args():
     p.add_argument("--scheme", choices=["loao", "kfold"], default="loao")
     p.add_argument("--n_folds", type=int, default=4, help="only for --scheme kfold")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--extend", default=None,
+                   help="prior manifest JSON: keep its fold assignment for animals it "
+                        "already covers and only place NEW animals (keeps a new CV run "
+                        "paired with the old one). Overrides --scheme/--seed placement.")
     p.add_argument("--out", default=None, help="JSON manifest path (default: <root>/clc_folds_<scheme>.json)")
     return p.parse_args()
 
@@ -134,11 +178,13 @@ def main():
     if not items:
         raise SystemExit(f"no original *_seg.npy under {args.root}/{{{','.join(subdirs)}}}")
 
-    folds, animals = make_folds(items, args.scheme, args.n_folds, args.seed)
+    folds, animals, extend_info = make_folds(items, args.scheme, args.n_folds,
+                                             args.seed, extend=args.extend)
 
     # --- summary ---
     print(f"CLC split — root={args.root}  scheme={args.scheme}"
-          + (f"  n_folds={args.n_folds}" if args.scheme == "kfold" else ""))
+          + (f"  n_folds={args.n_folds}" if args.scheme == "kfold" else "")
+          + (f"  EXTENDED from {args.extend}" if args.extend else ""))
     print(f"{len(items)} images, {len(animals)} animals\n")
     print("animal     age       n_img")
     print("-" * 32)
@@ -158,6 +204,8 @@ def main():
         "animals": {a: {"age": animals[a]["age"], "n_img": len(animals[a]["idx"])} for a in sorted(animals)},
         "folds": folds,
     }
+    if extend_info:
+        manifest["extends"] = extend_info
     with open(out, "w") as fh:
         json.dump(manifest, fh, indent=2)
     print(f"\nwrote manifest: {out}")
