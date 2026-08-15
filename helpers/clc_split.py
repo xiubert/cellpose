@@ -113,7 +113,26 @@ def _extend_groups(animals, names, prior_path):
     return groups, prior, new, missing
 
 
-def make_folds(items, scheme, n_folds, seed, extend=None):
+def _apply_pins(groups, pins):
+    """Force specific animals into specific folds, after placement.
+
+    WHY: leave-one-animal-out balances by image count, which can land two
+    animals of a RARE phenotype in the same fold — then no fold can ever test
+    "does having one of them in training help on the other", because the fold
+    that holds them out trained on neither. Pinning them to different folds
+    makes that transfer measurable.
+    """
+    for animal, fold in pins.items():
+        for g in groups:
+            if animal in g:
+                g.remove(animal)
+        if fold < 0 or fold >= len(groups):
+            raise SystemExit(f"--pin {animal}={fold}: fold out of range 0..{len(groups)-1}")
+        groups[fold].append(animal)
+    return groups
+
+
+def make_folds(items, scheme, n_folds, seed, extend=None, pins=None):
     # animal -> age, and animal -> list of item indices
     animals = {}
     for i, it in enumerate(items):
@@ -142,6 +161,15 @@ def make_folds(items, scheme, n_folds, seed, extend=None):
             for j, a in enumerate(ages):
                 groups[j % n_folds].append(a)
 
+    if pins:
+        unknown = [a for a in pins if a not in animals]
+        if unknown:
+            raise SystemExit(f"--pin refers to unknown animal(s): {unknown}")
+        groups = _apply_pins(groups, pins)
+        print(f"pinned: " + ", ".join(f"{a}->fold {k}" for a, k in sorted(pins.items())))
+        if extend_info is not None:
+            extend_info["pins"] = {a: int(k) for a, k in pins.items()}
+
     folds = []
     for k, test_animals in enumerate(groups):
         test_set = set(test_animals)
@@ -167,8 +195,23 @@ def parse_args():
                    help="prior manifest JSON: keep its fold assignment for animals it "
                         "already covers and only place NEW animals (keeps a new CV run "
                         "paired with the old one). Overrides --scheme/--seed placement.")
+    p.add_argument("--pin", action="append", default=[], metavar="ANIMAL=FOLD",
+                   help="force an animal into a specific fold, applied after "
+                        "--extend/scheme placement (repeatable). Use to spread "
+                        "animals of a rare phenotype across folds so transfer "
+                        "between them is measurable, e.g. --pin 8483=0")
     p.add_argument("--out", default=None, help="JSON manifest path (default: <root>/clc_folds_<scheme>.json)")
     return p.parse_args()
+
+
+def parse_pins(specs):
+    pins = {}
+    for s in specs:
+        if "=" not in s:
+            raise SystemExit(f"--pin expects ANIMAL=FOLD, got {s!r}")
+        a, k = s.rsplit("=", 1)
+        pins[a.strip()] = int(k)
+    return pins
 
 
 def main():
@@ -179,7 +222,8 @@ def main():
         raise SystemExit(f"no original *_seg.npy under {args.root}/{{{','.join(subdirs)}}}")
 
     folds, animals, extend_info = make_folds(items, args.scheme, args.n_folds,
-                                             args.seed, extend=args.extend)
+                                             args.seed, extend=args.extend,
+                                             pins=parse_pins(args.pin))
 
     # --- summary ---
     print(f"CLC split — root={args.root}  scheme={args.scheme}"
