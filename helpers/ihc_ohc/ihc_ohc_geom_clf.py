@@ -92,7 +92,8 @@ from ihc_ohc_crops import (
     update_pred,
 )
 from ihc_ohc_geom import (
-    FEATURE_NAMES, geom_features_for_seg, load_geom_npz,
+    BAND_RMS_MAX_OVER_D, FEATURE_NAMES, band_model_applies,
+    geom_features_for_seg, load_geom_npz,
 )
 
 IHC, OHC = 0, 1  # class indices, fixed (matches ihc_ohc_crops.CLASS_NAMES)
@@ -1046,13 +1047,40 @@ def _score_seg_geom(gk, fk, seg_path, *, write=False):
             pc_use = apply_calibrator(cc, pc) if cc is not None else pc
             pg_use = apply_calibrator(cg, pg) if cg is not None else pg
             f = fk["fuse"]
-            if f["method"] == "stack":
+
+            # BAND GUARD: geom's features are only meaningful when a cochlear
+            # centreline actually fits. Where it doesn't (a 20x field spans too
+            # much arc for the polynomial), fusing geom is strictly harmful —
+            # measured on a 1058-cell hand-labelled 20x image: CNN alone 0.988
+            # vs fused 0.196. Fall back to CNN-only there. No 63x image seen so
+            # far comes close to the threshold, so in-domain behaviour is
+            # unchanged. Disable with fuse.band_guard.enabled: false.
+            bg = fk.get("band_guard") or {}
+            band_ok = True
+            if bg.get("enabled", True):
+                band_ok, rms_over_d, _n = band_model_applies(
+                    seg, exclude_ids=excl,
+                    max_rms_over_d=float(bg.get("max_rms_over_d",
+                                                BAND_RMS_MAX_OVER_D)))
+                if not band_ok:
+                    print(f"  band guard: centreline rms/D={rms_over_d:.1f} "
+                          f"exceeds {bg.get('max_rms_over_d', BAND_RMS_MAX_OVER_D)} "
+                          f"— geom features unreliable, using CNN alone")
+
+            if not band_ok:
+                # CNN-only: its own 0.5 operating point, NOT the fuse threshold
+                # (that was tuned for the CNN+geom mixture and would skew the
+                # decision boundary when geom is dropped).
+                pf = pc_use
+                th = 0.5
+            elif f["method"] == "stack":
                 z = (np.column_stack([pc_use, pg_use]) @ np.array(f["coef"])
                      + f["intercept"])
                 pf = 1.0 / (1.0 + np.exp(-z))
+                th = float(f.get("threshold", 0.5))
             else:
                 pf = f["weight"] * pc_use + (1 - f["weight"]) * pg_use
-            th = float(f.get("threshold", 0.5))  # tuned at fuse-time
+                th = float(f.get("threshold", 0.5))  # tuned at fuse-time
             fused_map = {int(c): (CLASS_NAMES[IHC] if p >= th
                                   else CLASS_NAMES[OHC])
                          for c, p in zip(cids, pf)}
@@ -1060,8 +1088,10 @@ def _score_seg_geom(gk, fk, seg_path, *, write=False):
                           for c, p in zip(cids, pf)}
             # row-consistency post-pass (per-image; params ride in the
             # fuse ckpt so deployed/GUI inference applies the same rule)
+            # ...but not when the band guard fired: row-consistency re-anchors
+            # on the same perp bands the guard just declared unusable.
             rc = fk.get("row_consistency") or {}
-            if rc.get("enabled") and fused_map:
+            if rc.get("enabled") and fused_map and band_ok:
                 fused_map, fused_prob, row_override = row_consistency_refine(
                     cids, feats, fused_map, fused_prob,
                     conf_anchor=rc.get("conf_anchor", 0.85),

@@ -771,6 +771,50 @@ Deployed CLC config ships the conservative 0-break point
 any other dataset are unaffected unless they opt in. The remaining ~28
 higher-confidence errors are not safely auto-correctable and stay manual.
 
+## Band guard (when the geom model's premise does not hold)
+
+Added 2026-08-15. The geom classifier's entire signal is the **residual across
+a fitted cochlear centreline** — IHC on one side of the band, OHC on the other.
+That premise silently fails when the field of view spans more cochlear arc than
+a low-degree polynomial can follow, and then every axis feature is noise which
+the fusion happily inherits.
+
+Measured over the 31 CLC images of the 2026-07/08 batches, centreline residual
+in cell-diameter units (`band_fit_quality`):
+
+| image class | `rms/D` |
+|---|---|
+| normal 63x (n=25) | 1.10 – 2.33 (median 1.49) |
+| degeneration 63x (n=6) | 0.48 – 2.32 (median 1.13) |
+| **20x acquisition (n=1)** | **15.64** |
+
+`band_model_applies()` (in `ihc_ohc_geom.py`, threshold `BAND_RMS_MAX_OVER_D
+= 4.0` — in the empty gap, 1.7× above the worst 63x seen and 3.9× below the
+20x) gates the fusion in `_score_seg_geom`: when it fails, the fused decision
+falls back to the **CNN alone at its own 0.5 operating point** (not the fuse
+threshold, which was tuned for the CNN+geom mixture), and the row-consistency
+pass is skipped too — it re-anchors on the same bands just declared unusable.
+
+Validated on a 1262-cell 20x image with 1058 hand-labelled cells:
+
+| | accuracy on the 1058 labelled cells |
+|---|---|
+| deployed fusion (geom included) | **0.196** |
+| with the band guard (CNN alone) | **0.965** |
+| CNN alone, raw | 0.988 |
+
+and **zero** change in domain — two 63x images re-scored end-to-end returned
+138/138 and 147/147 identical labels. Disable with `fuse.band_guard.enabled:
+false`; tune with `max_rms_over_d`. Guard is **on by default**, including for
+fuse ckpts saved before it existed.
+
+**This is why 20x needs no separate classifier** (unlike segmentation, where
+20x genuinely does): the CNN already transfers across magnification — it reads
+a local crop — and it was only the geom's band model that broke. Note the
+guard does **not** fire on the degeneration images: their centrelines fit fine,
+and geom is not uniformly at fault there (on `8483 8khz` geom scores 0.86 while
+the CNN scores 0.11). That failure mode is separate and unsolved.
+
 ## Hair-cell mask post-processing (off-band false-positive reject)
 
 The row-consistency pass fixes *classification* errors; this pass fixes
@@ -836,6 +880,99 @@ label (Option A). Aggregate analyses honour `mask_reject` only when
 (Cunningham unaffected); the manifest block is opt-in param tuning only.
 
 ---
+
+# First held-out test on unseen animals (2026-08-15)
+
+The 2026-07/08 batches brought 31 new 63x images from **9 animals never in
+training** — the first chance to test the deployed classifier outside its own
+OOF. Two numbers, and the gap between them is the point:
+
+| | images | cells | acc | bal_acc |
+|---|---|---|---|---|
+| **unbiased** (near-fully-labelled images only) | 3 | 52 | **0.519** | 0.519 |
+| assumed-reviewed, normal 63x | 25 | 3324 | 0.987 | 0.977 |
+| assumed-reviewed, degeneration | 6 | 134 | 0.754 | 0.855 |
+| assumed-reviewed, 20x | 1 | 1262 | 0.326 | 0.558 |
+
+The 0.977 is an **upper bound, not a measurement**: only 102 of those 3324
+cells were human-checked, and the rest are "correct" by the 2026-08-14 decision
+to treat zero-correction images as reviewed (recorded per image, with risk
+flags, in `clc_review_status_20260814.json`). The one genuinely unbiased number
+available — 0.519 on the degeneration phenotype — is bad, and matches the
+segmentation side, where the same cochleae score 0.177 AP.
+
+**The structural problem this exposes:** CLC labels are the model's own accepted
+output plus corrections, so on any cell a human did not touch, "truth" *is* the
+deployed prediction and the model scores 100% by construction. Roughly 75 % of
+the training pool is self-graded. The fix the pipeline has always needed is a
+**gold set** — 1–2 animals labelled exhaustively by hand, independent of any
+model. Today the project has ~63 such cells, all on degeneration images.
+
+# Retraining on the 2026-07/08 labels — measured improvement (2026-08-15)
+
+Combined set `clc_ihc_ohc_all2` = 97 images / 29 animals / **13 068 cells**
+(vs 66 / 20 / 9 617 deployed): +165 human-labelled cells and ~3 286 accepted
+model labels. Caches `crops_clc2.npz` / `geom_clc2.npz`, configs
+`cnn_clc2.yaml` / `geom_clc2.yaml`.
+
+**How to compare, given self-graded labels.** Only the 165 human-labelled cells
+on the new images have truth independent of both models — everywhere else the
+"truth" is the deployed model's own output, so it scores 100 % by construction
+and any comparison is vacuous. Those 165 are also *error-enriched* (people
+correct what's broken), so neither number below is an accuracy; the **contrast**
+is what's meaningful. Splits are animal-grouped, so each cell is scored by a
+model that never saw its cochlea.
+
+| on the 165 independent cells | acc | bal_acc |
+|---|---|---|
+| deployed `clc-ihc-ohc` | 0.545 | 0.478 |
+| retrained, run 1 | 0.709 | 0.658 |
+| retrained, run 2 (replicate) | 0.721 | 0.687 |
+
+McNemar, retrained-only-right vs deployed-only-right: **35 v 8 (p=4e-05)** and
+**36 v 7 (p=9e-06)**. Replicate spread 0.012 acc — the +0.164 effect is ~13× it.
+
+**Two confounds ruled out:**
+- *Operating point.* The retrained fusion picks w=0.30/th=0.300 vs the deployed
+  0.40/0.400. Sidecars store `class_prob_fused` as confidence + label, so the
+  deployed model can be re-scored at any threshold: 0.50→0.545, 0.40→0.552,
+  0.30→0.509, 0.20→0.467. Re-thresholding makes it *worse*; its ceiling is
+  0.552. The gain is the data, not the threshold.
+- *Regression on the original domain.* Old-66 OOF bal_acc, scored exactly as the
+  deployed 0.984 was: **0.9850 / 0.9847** across the two runs. No regression.
+
+**What is still unverifiable:** whether the retrained model introduced errors on
+the ~3 286 cells whose labels are the deployed model's own output. That needs
+the gold set (above), not another retrain.
+
+Component ranking holds on the larger set: geom alone 0.965 > CNN alone 0.933,
+fusion beats both (vs geom p=7.6e-06).
+
+## Deployed as `clc-ihc-ohc-v2` (run `20260815-172440`)
+
+Driver `runs/clc2_train_driver.sh` (the standalone CNN-CV step is skipped — the
+fuse step already yields those OOF numbers). Artifacts:
+
+```
+runs/20260815-172440_clc2-train-cnn/best.pt
+runs/20260815-172440_clc2-train-geom/geom_best.pkl
+runs/20260815-172440_clc2-fuse/fuse.pkl        # w=0.30 CNN share, th=0.300
+```
+
+Manifest **`clc_ihc_ohc_v2.yaml`** (`name: clc-ihc-ohc-v2`). **v1 is untouched**
+— `clc_ihc_ohc.yaml` and the `20260624-003309_*` run dirs are intact, so rolling
+back is just re-selecting the v1 manifest in the GUI dropdown.
+
+End-to-end verification: on the **20x image, which is excluded from v2's
+training set and therefore genuinely held out**, v2 scores **0.974** on its 1058
+hand-labelled cells (v1: 0.196; v1 + band guard: 0.965). Re-scoring images that
+*are* in v2's training set (BL, CL) only confirms the checkpoints load — those
+numbers are in-sample and must not be read as accuracy.
+
+The operating point moved from w=0.40/th=0.400 to w=0.30/th=0.300 — the fuse
+step's own OOF selection on the larger set, consistent with geom again
+outscoring the CNN. It is not the source of the gain (see the threshold ablation
+above).
 
 # Evaluation caveats & known limitations
 

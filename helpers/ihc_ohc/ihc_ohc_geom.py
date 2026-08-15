@@ -83,6 +83,16 @@ FLAG_SPARSE = 2         # too few neighbours (damaged / edge of tissue)
 FLAG_EXTRAP = 4         # beyond a spline endpoint (extrapolated position)
 FLAG_FEW_CELLS = 8      # whole image has too few cells to fit the axis
 
+# Image-level guard: above this centreline residual (in cell-diameter units)
+# the band premise the whole geom model rests on does not hold, so its
+# features are noise and it must not be fused. Measured 2026-08-14 over 31
+# CLC images: normal 63x rms/D 1.10-2.33 (median 1.49), degeneration 0.48-2.32,
+# a 20x acquisition 15.64 — the polynomial cannot follow that much cochlear
+# arc. 4.0 sits in the empty gap: 1.7x above the worst 63x image seen, 3.9x
+# below the 20x. (Distinct from the per-cell 3.0*D flag above, which only
+# marks cells for review and changes no decision.)
+BAND_RMS_MAX_OVER_D = 4.0
+
 # Order matters: this is the column order of the returned feature matrix and
 # of every saved table. Keep it stable so saved models stay loadable.
 FEATURE_NAMES = [
@@ -354,6 +364,40 @@ def geom_features_for_seg(seg, *, k_neighbors=6, min_cells=6, exclude_ids=None):
 
     cents = np.column_stack([cx, cy]).astype(np.float32)
     return cell_ids, feats, flags.astype(int), cents
+
+
+def band_fit_quality(seg, *, exclude_ids=None):
+    """(rms_over_D, n_cells) for one seg — how well the cochlear centreline fits.
+
+    The geom classifier's entire signal is the residual across a fitted
+    centreline: IHC sit on one side of the band, OHC on the other. That premise
+    fails when the field of view spans more cochlear arc than a low-degree
+    polynomial can follow (e.g. a 20x acquisition), and then every axis feature
+    is noise. This exposes the diagnostic so callers can refuse to fuse geom —
+    see BAND_RMS_MAX_OVER_D and `band_model_applies`.
+
+    Cheap: regionprops + SVD + polyfit, no model involved.
+    """
+    props = _shape_props(seg["masks"])
+    cell_ids = sorted(props)
+    if exclude_ids:
+        cell_ids = [c for c in cell_ids if c not in exclude_ids]
+    n = len(cell_ids)
+    if n < 4:
+        return float("nan"), n
+    cx = np.array([props[c]["cx"] for c in cell_ids], float)
+    cy = np.array([props[c]["cy"] for c in cell_ids], float)
+    D = float(np.median([props[c]["eqdiam"] for c in cell_ids])) or 1.0
+    cl = _fit_centerline(cx, cy)
+    return float(cl["rms"] / D), n
+
+
+def band_model_applies(seg, *, exclude_ids=None, max_rms_over_d=BAND_RMS_MAX_OVER_D):
+    """True when the geom band premise holds well enough to trust its features."""
+    rms_over_d, n = band_fit_quality(seg, exclude_ids=exclude_ids)
+    if not np.isfinite(rms_over_d):
+        return False, rms_over_d, n
+    return rms_over_d <= max_rms_over_d, rms_over_d, n
 
 
 # ── hair-cell mask post-processing (off-band cluster reject) ─────────────────────

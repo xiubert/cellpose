@@ -1,0 +1,57 @@
+# Cell-type classifier manifest for the Cellpose GUI — in-house CLC egfp
+# dataset, **v2** (2026-08-15). Sibling of clc_ihc_ohc.yaml, which is left
+# intact: re-select the v1 manifest in the GUI dropdown to roll back.
+#
+# Register via Models menu → "Add cell-type classifier (manifest .yaml)" →
+# pick this file. Relative ckpt paths resolve against this file's dir
+# (helpers/ihc_ohc/). Container paths assumed (GUI runs in the container).
+#
+# WHAT CHANGED vs v1 (run 20260624-003309)
+#   data   66 imgs / 20 animals / 9617 cells  ->  97 / 29 / 13068
+#          (+ the 2026-07 and 2026-08 batches: 31 new 63x images, 9 new
+#           animals, 165 new human-labelled cells; the 20x image is NOT in
+#           the training set — see the band guard note below)
+#   fusion w 0.40 -> 0.30 (CNN share), threshold 0.400 -> 0.300, both
+#          OOF-selected on the larger set. geom again outscores the CNN
+#          (0.965 vs 0.933 bal_acc), hence the smaller CNN share.
+#
+# EVIDENCE (ihc_ohc.md, "Retraining on the 2026-07/08 labels"):
+#   On the 165 human-labelled cells of the new images — the only cells whose
+#   truth is independent of the deployed model — accuracy 0.545 -> 0.709/0.721
+#   across two runs, McNemar 35v8 (p=4e-05) and 36v7 (p=9e-06). Replicate
+#   spread 0.012, so the effect is ~13x the noise floor. Not an operating-point
+#   artifact: re-thresholding v1 anywhere in 0.20-0.50 tops out at 0.552.
+#   No regression on the original 66 images (OOF bal_acc 0.985 vs v1's 0.984).
+#
+# CAVEAT: those 165 cells are error-enriched (curators label what looks wrong),
+# so neither number is an accuracy — the contrast is what's measured. Roughly
+# 75% of the training pool is self-graded (label = the previous model's accepted
+# output), so regressions there are unverifiable. The fix is a hand-labelled
+# gold set of 1-2 animals, still outstanding.
+
+name: clc-ihc-ohc-v2
+cnn_ckpt:  runs/20260815-172440_clc2-train-cnn/best.pt
+geom_ckpt: runs/20260815-172440_clc2-train-geom/geom_best.pkl
+fuse_ckpt: runs/20260815-172440_clc2-fuse/fuse.pkl
+
+# Per-class mask tint (RGB 0–255). Unchanged from v1 — magenta + cyan stay
+# readable over the red or green fluorescence channel.
+classes:
+  IHC: [232, 38, 220]   # magenta
+  OHC: [40, 220, 230]   # cyan
+
+# Off-band false-positive reject panel. Operating point unchanged from v1
+# (validated on 67 GT images: 0.03% false deletions, 0 real detections lost).
+hair_cell_postprocess:
+  eps: 2.5        # link cells within eps·D (D = per-image median diameter)
+  min_gap: 5.0    # reject only clusters ≥ this many D from the band
+  max_frac: 0.4   # …and no larger than this fraction of the band
+  min_cells: 20   # below this, "the band" is undefined → no-op
+
+# NOTE — the BAND GUARD is a code path (ihc_ohc_geom.py), not a checkpoint
+# setting, so it applies to v1 and v2 alike and needs nothing here. It drops
+# geom from the fusion when the cochlear centreline cannot fit (rms/D > 4.0),
+# falling back to the CNN alone: on a hand-labelled 20x image that is
+# 0.196 -> 0.965, with byte-identical labels on 63x. Override only if needed:
+#   fuse:
+#     band_guard: {enabled: false}        # or {max_rms_over_d: 6.0}

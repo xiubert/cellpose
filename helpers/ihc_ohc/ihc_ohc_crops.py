@@ -89,7 +89,7 @@ def base_stem(stem):
 
 
 _FREQ_RE = re.compile(r"(\d+)\s*khz", re.IGNORECASE)
-_ANIMAL_RE = re.compile(r"^\d+[LR]?$")
+_ANIMAL_RE = re.compile(r"^(?:\d+[LR]?|[A-Z]{1,2}[LR])$")
 
 
 def parse_animal(stem):
@@ -100,6 +100,12 @@ def parse_animal(stem):
     (8/16/32 khz) come from one cochlea and must never straddle a split.
     'samples_1_4L 8khz' -> 4L (animal glued into the sample token);
     'Samples_13_63x 5165 8khz' -> 5165. Raises if no animal token found.
+
+    Ids are numeric (`5042L`, `1L`, `8363`) **or** lettered (`AL`, `BL`, …,
+    the 2026-07 neonate batch). Keep this regex in sync with
+    `helpers/clc_split.py` — the two are deliberate duplicates so the geom
+    stack stays torch-free and self-contained, but a new id style must be
+    added to BOTH or the two projects will group the same data differently.
     """
     m = _FREQ_RE.search(stem)
     head = stem[:m.start()] if m else stem
