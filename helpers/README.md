@@ -73,6 +73,7 @@ After any edit under `cellpose/` or to a trainer script:
 |---|---|
 | `*.py`, `*.slurm`, `submit*.sh`, `trainer.yaml`, `trainer_deploy.yaml` | **the pipeline** — baseline recipe + production recipe only — the only things `update_cluster.sh` deploys. Kept flat because the cluster expects them flat in `~/cellpose/` |
 | `ihc_ohc/` | the IHC/OHC classifier, self-contained (container paths — don't move) |
+| `quant/` | **marker quantification** — per-cell signal inside the masks for a channel other than the segmented one (HA/eGFP reporter). GUI panel + CLI |
 | `notes/` | the experimental record (see §5) |
 | `probes/` | one-off diagnostics and experiment watchers. Evidence, not pipeline — nothing depends on them |
 | `experiments/` | **settled experiment arms** — configs for hypotheses tested and found not to help (warm-start, FN-augmentation, boundary loss, fixed scale). Has its own README with each result, so nobody re-runs them |
@@ -128,6 +129,15 @@ podman exec cellpose python3 /helpers/ihc_ohc/ihc_ohc_crops.py \
    --data_dir /data/cellpose_cc/<dir> --out .../crops.npz --channel 0 --group_mode clc
 bash runs/clc2_train_driver.sh          # CNN + geom + fuse, one shared stamp
 podman exec cellpose python3 /helpers/ihc_ohc/ihc_ohc_pipeline.py predict --dir <dir>
+
+# ── marker quantification (container) ──────────────────────────────────────
+# GUI: "marker quantification" panel — pick the channel, click export.
+# CLI mirrors it. There is NO default channel, by design (see below).
+Q=/helpers/quant/marker_quant.py
+podman exec cellpose python3 $Q inventory --dir /data/cellpose_cc/adult   # what dyes exist?
+podman exec cellpose python3 $Q inspect --seg <seg.npy>                   # which one is the reporter?
+podman exec cellpose python3 $Q measure --seg <seg.npy> --channel ch01    # → _quant_ch01.csv
+podman exec cellpose python3 $Q collect --dir <dir> --out table.csv       # pool what's measured
 ```
 
 Long jobs: submit via SLURM and watch `squeue -M gpu -u $USER`. There is no
@@ -160,6 +170,15 @@ Long jobs: submit via SLURM and watch `squeue -M gpu -u $USER`. There is no
 - **Percentile normalisation is affine-invariant.** Pre-scaling an image without
   also disabling cellpose's normalisation is a mathematical no-op — it silently
   reproduces the baseline. `clc_error_eval.py` still hardcodes `normalize=True`.
+- **A channel index does not identify a marker.** `neonate/` mixes two
+  acquisition protocols: ch01 is ALEXA 647 in one and eGFP in the other, and
+  the *segmented* channel is ch01 in one and ch02 in the other. Quantification
+  therefore never picks a channel for you — read `MetaData/<base>.xml` (or run
+  `marker_quant.py inventory`) and choose per image.
+- **Matching image dimensions prove nothing.** Every image here is 1024×1024, so
+  a file from a different animal passes a shape check and yields plausible
+  numbers against the wrong masks. Base stems are what identify an acquisition
+  (99 distinct, zero collisions) — that is what `check_pairing` compares.
 
 ## 6. Where the detail lives
 

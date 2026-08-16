@@ -1,0 +1,23 @@
+# Marker quantification — measurement parameters.
+#
+# This file deliberately does NOT name a channel, a dye, or a marker. Neither
+# the channel->dye map nor the index of the segmented channel is consistent
+# across this dataset (neonate/ alone mixes two acquisition protocols, one
+# without eGFP), so encoding a convention here would silently quantify the
+# wrong fluorophore. Channel choice is a per-image human act, recorded in each
+# image's <stem>_quant.npy sidecar.  See notes/marker_quant_design.md §D1, §D9.
+#
+# Positivity calling, when it exists, adds a `call:` block here — that is why
+# this file exists now rather than later.
+
+schema_version: 1
+
+# Local background annulus. ring_px ~ 1/3 of a 63x hair-cell diameter: wide
+# enough to average out shot noise, narrow enough to stay local.
+ring_px: 8
+
+# Below this many valid (non-mask) annulus pixels, the row falls back to the
+# image-level background and records bg_source = "image". The organ of Corti is
+# densely packed, so the annulus is often mostly other cells — the fallback is
+# expected, and every row says which was used.
+min_ring_px: 50

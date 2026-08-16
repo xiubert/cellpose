@@ -8,14 +8,14 @@ from qtpy import QtGui, QtCore
 from superqt import QRangeSlider, QCollapsible
 from qtpy.QtWidgets import QScrollArea, QMainWindow, QApplication, QWidget, QScrollBar, \
     QComboBox, QGridLayout, QPushButton, QFrame, QCheckBox, QLabel, QProgressBar, \
-        QLineEdit, QMessageBox, QGroupBox, QMenu, QAction
+        QLineEdit, QMessageBox, QGroupBox, QMenu, QAction, QFileDialog
 import pyqtgraph as pg
 
 import numpy as np
 from scipy.stats import mode
 import cv2
 
-from . import guiparts, menus, io, celltype
+from . import guiparts, menus, io, celltype, quant
 from .. import models, core, dynamics, version, train
 from ..utils import download_url_to_file, masks_to_outlines, diameters
 from ..io import get_image_files, imsave, imread
@@ -692,6 +692,105 @@ class MainW(QMainWindow):
 
 
         b += 1
+        # Marker quantification: per-cell signal inside the masks, for a channel
+        # OTHER than the one the cells were segmented on (e.g. the HA/eGFP
+        # reporter). Last in the workflow — it consumes the masks and, when
+        # present, the cell-type labels.
+        #
+        # The dropdown deliberately starts unselected and export stays disabled
+        # until the user picks: neither the channel->dye map nor the index of
+        # the segmented channel is stable across this data (neonate/ alone mixes
+        # two acquisition protocols), so any default would silently quantify the
+        # wrong fluorophore. See helpers/notes/marker_quant_design.md.
+        self.quantBox = QGroupBox("marker quantification")
+        self.quantBox.setFont(self.boldfont)
+        self.quantBoxG = QGridLayout()
+        self.quantBox.setLayout(self.quantBoxG)
+        self.l0.addWidget(self.quantBox, b, 0, 1, 9)
+
+        self.QuantChooseC = QComboBox()
+        self.QuantChooseC.setFont(self.medfont)
+        self.QuantChooseC.addItem("select channel to measure")
+        self.QuantChooseC.setFixedWidth(175)
+        self.QuantChooseC.setToolTip(
+            "channel whose signal is measured inside each mask — labelled with "
+            "the dye from the acquisition metadata where available. Nothing is "
+            "selected by default: the channel index does not mean the same dye "
+            "across all images in this dataset.")
+        self.quantBoxG.addWidget(self.QuantChooseC, 0, 0, 1, 5)
+
+        # Visual verification: swap the viewport to the channel being measured,
+        # masks left in place. A toggle, not a merge — the point is to judge
+        # "is this cell really positive" against the same outlines.
+        self.QuantShowButton = QPushButton(u"show")
+        self.QuantShowButton.setFont(self.medfont)
+        self.QuantShowButton.setFixedWidth(50)
+        self.QuantShowButton.setToolTip(
+            "show the selected channel in the viewer (masks unchanged); "
+            "click again to go back to the segmentation channel")
+        self.QuantShowButton.clicked.connect(self.toggle_quant_show)
+        self.quantBoxG.addWidget(self.QuantShowButton, 0, 5, 1, 2)
+        self.QuantShowButton.setEnabled(False)
+
+        self.QuantExportButton = QPushButton(u"export")
+        self.QuantExportButton.setFont(self.medfont)
+        self.QuantExportButton.setFixedWidth(55)
+        self.QuantExportButton.setToolTip(
+            "measure every mask in the selected channel and write "
+            "<stem>_quant_<ch>.csv plus the <stem>_quant.npy sidecar")
+        self.QuantExportButton.clicked.connect(self.export_quant)
+        self.quantBoxG.addWidget(self.QuantExportButton, 0, 7, 1, 2)
+        self.QuantExportButton.setEnabled(False)
+
+        # Provenance line — what is about to be measured is never implicit.
+        self.QuantStatus = QLabel("no image loaded")
+        self.QuantStatus.setFont(self.medfont)
+        self.QuantStatus.setWordWrap(True)
+        self.QuantStatus.setToolTip(
+            "resolved channel file, data plane and dye for the current "
+            "selection")
+        self.quantBoxG.addWidget(self.QuantStatus, 1, 0, 1, 9)
+
+        self.QuantInspectButton = QPushButton(u"inspect")
+        self.QuantInspectButton.setFont(self.medfont)
+        self.QuantInspectButton.setToolTip(
+            "print in-mask vs background signal for every discovered channel — "
+            "how to tell the reporter from the antibody when metadata is thin")
+        self.QuantInspectButton.clicked.connect(self.inspect_quant_channels)
+        self.quantBoxG.addWidget(self.QuantInspectButton, 2, 0, 1, 3)
+        self.QuantInspectButton.setEnabled(False)
+
+        self.QuantSourceButton = QPushButton(u"source…")
+        self.QuantSourceButton.setFont(self.medfont)
+        self.QuantSourceButton.setToolTip(
+            "folder to look for sibling channel files in (defaults to the "
+            "image's own folder; remembered between images)")
+        self.QuantSourceButton.clicked.connect(self.choose_quant_source)
+        self.quantBoxG.addWidget(self.QuantSourceButton, 2, 3, 1, 3)
+
+        self.QuantFileButton = QPushButton(u"file…")
+        self.QuantFileButton.setFont(self.medfont)
+        self.QuantFileButton.setToolTip(
+            "pick the channel image explicitly, for when siblings aren't "
+            "staged anywhere findable")
+        self.QuantFileButton.clicked.connect(self.choose_quant_file)
+        self.quantBoxG.addWidget(self.QuantFileButton, 2, 6, 1, 3)
+
+        # Per-image state: discovered channels, and an explicitly-picked file
+        # that overrides discovery. The source root is a session setting and
+        # lives in ~/.cellpose/gui_quant.json.
+        self.quant_channels = []
+        self.quant_override = None
+        # View-toggle state. The backup holds the segmentation-channel stack
+        # (and its display levels) while a quant channel is shown, so toggling
+        # back is exact rather than a re-read.
+        self.quant_showing = False
+        self.quant_stack_backup = None
+        self.quant_saturation_backup = None
+        self.QuantChooseC.currentIndexChanged.connect(self._update_quant_status)
+
+
+        b += 1
         self.filterBox = QGroupBox("Image filtering")
         self.filterBox.setFont(self.boldfont)
         self.filterBox_grid_layout = QGridLayout()
@@ -902,6 +1001,7 @@ class MainW(QMainWindow):
         self.CelltypeButtonC.setEnabled(ct_ready and not self.labeling_celltype)
         self.CelltypeLabelButtonC.setEnabled(ct_ready)
         self._update_hcpp_buttons()
+        self._update_quant_status()
         for i in range(len(self.StyleButtons)):
             self.StyleButtons[i].setEnabled(True)
 
@@ -2450,6 +2550,312 @@ class MainW(QMainWindow):
         print(f"GUI_INFO: hair-cell post-processing {verb} "
               f"{len(self.hcpp_reject)} off-band mask(s)")
 
+    # ── marker quantification ──────────────────────────────────────────────
+
+    def reset_quant_state(self):
+        """Rediscover channels for the newly-loaded image.
+
+        Called from io._initialize_images, so every image load (with or without
+        masks) repopulates the dropdown. The selection is deliberately NOT
+        carried across images: ch01 is eGFP in one acquisition protocol and
+        ALEXA 647 in another, so a sticky index would silently change what is
+        being measured when the user steps to the next file.
+        """
+        if not hasattr(self, "QuantChooseC"):
+            return
+        # Drop the view backup rather than restoring it — this runs from
+        # _initialize_images, i.e. after the new image is already in self.stack,
+        # so the backup refers to the image we just left.
+        self.quant_showing = False
+        self.quant_stack_backup = None
+        self.quant_saturation_backup = None
+        self.QuantShowButton.setText("show")
+        self.QuantShowButton.setStyleSheet(self.styleUnpressed)
+        self.quant_channels = []
+        self.quant_override = None
+        self.QuantChooseC.blockSignals(True)
+        self.QuantChooseC.clear()
+        self.QuantChooseC.addItem("select channel to measure")
+
+        fn = getattr(self, "filename", None)
+        if fn and quant.available():
+            try:
+                self.quant_channels = quant.discover(fn)
+            except Exception as e:  # noqa: BLE001
+                print(f"WARNING: channel discovery failed: {e}")
+            for ch in self.quant_channels:
+                self.QuantChooseC.addItem(quant.channel_label(ch))
+        self.QuantChooseC.setCurrentIndex(0)
+        self.QuantChooseC.blockSignals(False)
+        self._update_quant_status()
+
+    def _quant_channel(self):
+        """The channel the user has selected, or None. An explicit file pick
+        overrides discovery."""
+        if self.quant_override is not None:
+            return self.quant_override
+        idx = self.QuantChooseC.currentIndex()
+        if idx <= 0 or idx > len(self.quant_channels):
+            return None
+        return self.quant_channels[idx - 1]
+
+    def _update_quant_status(self):
+        """Refresh the provenance line and button enablement."""
+        if not hasattr(self, "QuantStatus"):
+            return
+        has_img = bool(getattr(self, "filename", None))
+        ready = has_img and self.NZ == 1 and self.ncells.get() > 0
+        ch = self._quant_channel()
+
+        if not quant.available():
+            msg = "quant helpers not found (/helpers/quant not mounted)"
+        elif not has_img:
+            msg = "no image loaded"
+        elif not self.quant_channels and self.quant_override is None:
+            # Roughly a third of this dataset has only the segmented channel
+            # staged. Say so plainly — never fall back to measuring it.
+            msg = ("no sibling channel files found — set <b>source…</b> to the "
+                   "folder holding them, or pick one with <b>file…</b>")
+        elif ch is None and all(c.get("is_seg_channel")
+                                for c in self.quant_channels):
+            # The only file here is the one the masks came from. It is
+            # measurable (as a positive control) but it is not a marker
+            # readout — say so, rather than letting "1 channel found" read as
+            # "you're all set".
+            msg = ("only the <b>segmented</b> channel is staged here — no "
+                   "marker channel to measure. Set <b>source…</b> or pick one "
+                   "with <b>file…</b>")
+        elif ch is None:
+            msg = f"{len(self.quant_channels)} channel(s) found — select one"
+        else:
+            dye = ch.get("dye") or "<b>dye unknown</b> (no MetaData)"
+            seg_note = (" &nbsp;<b>[segmented channel]</b>"
+                        if ch.get("is_seg_channel") else "")
+            msg = (f"{os.path.basename(ch['path'])}<br>{dye}"
+                   f"{' · ' + ch['lut'] if ch.get('lut') else ''}{seg_note}")
+            if self.ncells.get() == 0:
+                msg += "<br>no masks — segment or load masks first"
+        done = quant.measured_channels(
+            os.path.splitext(self.filename)[0] + "_seg.npy") if has_img else []
+        if done:
+            msg += f"<br>already measured: {', '.join(done)}"
+        self.QuantStatus.setText(msg)
+
+        self.QuantExportButton.setEnabled(bool(ready and ch is not None))
+        self.QuantInspectButton.setEnabled(
+            bool(has_img and self.NZ == 1 and self.ncells.get() > 0
+                 and self.quant_channels))
+        # Showing needs an image and a channel, but not masks — being able to
+        # look at the channel before segmenting is useful on its own.
+        self.QuantShowButton.setEnabled(bool(has_img and ch is not None))
+
+        # If the selection changes while a channel is displayed, follow it
+        # rather than leaving the viewer showing the previous channel.
+        if self.quant_showing and ch is not None and \
+                ch.get("path") != getattr(self, "quant_shown_path", None):
+            self._show_quant_channel(ch)
+
+    def choose_quant_source(self):
+        """Pick the folder to look for sibling channel files in.
+
+        Persisted across images and sessions — sibling channels are often not
+        staged next to the seg, and re-picking per image would be unusable.
+        """
+        start = quant.source_root() or (os.path.dirname(self.filename)
+                                        if getattr(self, "filename", None)
+                                        else "")
+        d = QFileDialog.getExistingDirectory(
+            self, "Folder containing the channel images", start)
+        if not d:
+            return
+        quant.save_settings(source_root=d)
+        print(f"GUI_INFO: quant channel source → {d}")
+        self.reset_quant_state()
+
+    def choose_quant_file(self):
+        """Pick the channel image explicitly.
+
+        Guarded by the same stem check the CLI uses: every image in this dataset
+        is 1024x1024, so matching dimensions prove nothing about whether a file
+        belongs to this acquisition — the base stem is what identifies it.
+        """
+        if not getattr(self, "filename", None):
+            print("ERROR: no image loaded")
+            return
+        start = quant.source_root() or os.path.dirname(self.filename)
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select channel image", start, "Images (*.tif *.tiff *.png)")
+        if not path:
+            return
+        seg_path = os.path.splitext(self.filename)[0] + "_seg.npy"
+        status, msg = quant.check_pairing(seg_path, path)
+        if status == "mismatch":
+            reply = QMessageBox.warning(
+                self, "Channel file may not belong to this image",
+                f"{msg}\n\nMeasure it anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+            print(f"WARNING: {msg}\n  proceeding — user override")
+        elif status == "unknown":
+            print(f"WARNING: {msg}")
+
+        self.quant_override = quant.channel_from_file(path, seg_path)
+        self.quant_override["pairing_override"] = (status == "mismatch")
+        self.QuantChooseC.blockSignals(True)
+        self.QuantChooseC.setCurrentIndex(0)
+        self.QuantChooseC.blockSignals(False)
+        print(f"GUI_INFO: quant channel file → {path}")
+        self._update_quant_status()
+
+    def toggle_quant_show(self):
+        """Toggle the viewer between the segmentation channel and the channel
+        being quantified. Masks, outlines and cell ids are untouched — this
+        only swaps the image underneath them."""
+        ch = self._quant_channel()
+        if ch is None:
+            print("ERROR: select a channel to show first")
+            return
+        if self.quant_showing:
+            self.restore_quant_view()
+        else:
+            self._show_quant_channel(ch)
+
+    def _show_quant_channel(self, ch):
+        """Put `ch`'s raw data plane in the viewport.
+
+        The plane is read from the file (never from self.stack, which is a
+        display product) and broadcast across all three RGB planes, so it
+        renders as greyscale under the default view and can still be colourised
+        via the RGB dropdown. Intensity is judged by eye here, so the same
+        global min-max → 0-255 mapping io._initialize_images applies to a
+        loaded image is applied, keeping the sliders meaningful.
+        """
+        try:
+            plane, plane_idx = quant.channel_plane(ch["path"])
+        except Exception as e:  # noqa: BLE001
+            print(f"ERROR: could not read channel image: {e}")
+            return
+        if plane.shape != tuple(self.stack.shape[1:3]):
+            print(f"ERROR: channel image {plane.shape} does not match the "
+                  f"displayed image {tuple(self.stack.shape[1:3])}")
+            return
+
+        # The filtered/restored view reads stack_filtered, so the swap would be
+        # invisible there — drop back to the raw view and say so.
+        if self.view != 0:
+            print("GUI_INFO: switching to the raw view to show the channel")
+            self.ViewDropDown.setCurrentIndex(0)
+
+        img = plane.astype(np.float32)
+        lo, hi = float(img.min()), float(img.max())
+        img = img - lo
+        if hi > lo + 1e-3:
+            img /= (hi - lo)
+        img *= 255
+        stack = np.repeat(img[np.newaxis, :, :, np.newaxis], 3, axis=3)
+
+        if not self.quant_showing:
+            self.quant_stack_backup = self.stack
+            self.quant_saturation_backup = copy.deepcopy(self.saturation)
+        self.stack = stack
+        self.quant_showing = True
+        self.quant_shown_path = ch["path"]
+
+        # Percentile levels for the new channel. Only when auto-adjust is on —
+        # if the user set levels by hand, that is an explicit choice to respect.
+        if self.autobtn.isChecked():
+            pct = self.get_normalize_params()["percentile"]
+            x01 = float(np.percentile(img, pct[0]))
+            x99 = float(np.percentile(img, pct[1]))
+            self.saturation = [[[x01, x99] for _ in range(self.NZ)]
+                               for _ in range(3)]
+
+        self.QuantShowButton.setText("hide")
+        self.QuantShowButton.setStyleSheet(self.stylePressed)
+        self.update_plot()
+        dye = ch.get("dye") or "dye unknown"
+        print(f"GUI_INFO: showing {ch['tag']} ({dye}) — plane {plane_idx} of "
+              f"{os.path.basename(ch['path'])}; masks unchanged")
+
+    def restore_quant_view(self, quiet=False):
+        """Put the segmentation channel back in the viewport.
+
+        Also called defensively before segmentation, which reads self.stack as
+        its input — running cpsam while the reporter channel is displayed would
+        otherwise segment the wrong channel.
+        """
+        if not self.quant_showing or self.quant_stack_backup is None:
+            self.quant_showing = False
+            return False
+        self.stack = self.quant_stack_backup
+        self.quant_stack_backup = None
+        if self.quant_saturation_backup is not None:
+            self.saturation = self.quant_saturation_backup
+            self.quant_saturation_backup = None
+        self.quant_showing = False
+        self.quant_shown_path = None
+        self.QuantShowButton.setText("show")
+        self.QuantShowButton.setStyleSheet(self.styleUnpressed)
+        self.update_plot()
+        if not quiet:
+            print("GUI_INFO: restored the segmentation channel view")
+        return True
+
+    def inspect_quant_channels(self):
+        """Print in-mask vs background signal for every discovered channel."""
+        if not self.quant_channels:
+            print("ERROR: no channel files discovered")
+            return
+        seg_path = self._prepare_seg_for_disk_read()
+        if seg_path is None:
+            return
+        try:
+            print(f"GUI_INFO: channel inspection for "
+                  f"{os.path.basename(self.filename)}")
+            print(quant.inspect(seg_path, self.quant_channels))
+        except Exception as e:  # noqa: BLE001
+            print(f"ERROR: channel inspection failed: {e}")
+
+    def export_quant(self):
+        """Measure the selected channel inside every mask and export.
+
+        Writes <stem>_quant_<ch>.csv plus a <stem>_quant.npy sidecar, and
+        prints the summary. Rejected (off-band) masks get a row with the flag
+        set — the summary excludes them, the CSV keeps them.
+        """
+        ch = self._quant_channel()
+        if ch is None:
+            print("ERROR: select a channel to measure first")
+            return
+        if not self.filename:
+            print("ERROR: no image loaded")
+            return
+        if self.NZ != 1:
+            print("ERROR: marker quantification is 2D-only; image is 3D")
+            return
+        if self.ncells.get() == 0:
+            print("ERROR: no masks — segment or load masks first")
+            return
+        seg_path = self._prepare_seg_for_disk_read()
+        if seg_path is None:
+            return
+
+        self.progress.setValue(10)
+        try:
+            rows, meta, csv_out = quant.measure(
+                seg_path, ch, allow_mismatch=bool(ch.get("pairing_override")))
+        except Exception as e:  # noqa: BLE001
+            print(f"ERROR: marker quantification failed: {e}")
+            self.progress.setValue(0)
+            return
+        self.progress.setValue(100)
+        print(f"GUI_INFO: marker quantification — "
+              f"{os.path.basename(self.filename)}")
+        print(quant.summarize(rows, meta))
+        print(f"  wrote {csv_out}")
+        self._update_quant_status()
+
     def new_model(self):
         if self.NZ != 1:
             print("ERROR: cannot train model on 3D data")
@@ -2548,6 +2954,15 @@ class MainW(QMainWindow):
 
     def compute_segmentation(self, custom=False, model_name=None, load_model=True):
         self.progress.setValue(0)
+        # Segmentation reads self.stack as its input, so running it while the
+        # marker channel is displayed would segment the reporter instead of the
+        # antibody. Put the real image back first rather than silently
+        # producing masks from the wrong channel.
+        if getattr(self, "quant_showing", False):
+            self.restore_quant_view(quiet=True)
+            print("GUI_INFO: restored the segmentation channel view before "
+                  "running the model (segmentation always uses the loaded "
+                  "image, not the displayed marker channel)")
         try:
             tic = time.time()
             self.clear_all()

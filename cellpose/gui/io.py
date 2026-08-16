@@ -229,6 +229,13 @@ def _initialize_images(parent, image, load_3D=False):
     else:
         parent.currentZ = 0
 
+    # Rediscover marker-quantification channels for this image. Hooked here
+    # rather than in _masks_to_gui so it also fires for images loaded without
+    # masks, and because parent.filename is set by every caller before this
+    # point. Guarded for the early init call, before the panel exists.
+    if hasattr(parent, "reset_quant_state"):
+        parent.reset_quant_state()
+
 
 def _load_seg(parent, filename=None, image=None, image_file=None, load_3D=False):
     """ load *_seg.npy with filename; if None, open QFileDialog """
