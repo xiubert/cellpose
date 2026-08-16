@@ -1,5 +1,7 @@
 # CLC mask-segmentation experiment plan
 
+- see: https://claude.ai/code/artifact/e09fee12-17b0-4c18-9900-7d58b3ac667d
+
 > **⚠️ HISTORICAL PLAN — executed and closed (2026-06-23).** This is the
 > *design* doc, written when `label_xfer_aug_retest` was the incumbent and only
 > 15 CLC images existed. It is kept for the methodology (§2 augmentation
