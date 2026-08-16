@@ -3,6 +3,7 @@ import os
 import sys
 from datetime import datetime
 
+import numpy as np
 import yaml
 from cellpose import io, models, train
 
@@ -49,6 +50,8 @@ DEFAULTS = {
     "model_name": "label_xfer_aug_retest",
     "nimg_per_epoch": None,   # crops sampled per epoch; None -> #train files
     "boundary_weight": 0.0,   # separation-aware boundary loss alpha; 0 = stock
+    "fixed_scale": None,      # divide images by this and DISABLE cellpose's
+                              # per-image [p1,p99] normalisation; None = stock
 }
 
 config_path = os.environ.get(
@@ -92,12 +95,41 @@ logger.info(
 )
 
 
+# --- optional FIXED-SCALE preprocessing (train.fixed_scale in the yaml) --------
+# Cellpose normalises each image to its own [p1, p99], so the input scale depends
+# on HOW MANY CELLS happen to be in frame. On sparse/degeneration images p99 falls
+# BELOW the median cell pixel, putting most of the cell signal above the ceiling
+# (notes/model_train_log.md §4d). fixed_scale divides by a constant instead, so
+# the intensity->network mapping is identical for every image.
+# None = stock percentile behaviour = every model trained before 2026-08.
+#
+# CRITICAL: pre-scaling alone is a NO-OP. train_seg(normalize=True) applies
+# percentile normalisation, which is affine-invariant —
+#   (x/s - p1/s)/(p99/s - p1/s) == (x - p1)/(p99 - p1)
+# — so dividing by a constant first changes nothing unless cellpose's own
+# normalisation is ALSO disabled. Hence normalize=False below whenever
+# fixed_scale is set. Getting this wrong silently reproduces the baseline.
+#
+# INFERENCE MUST MATCH (pre-scale + normalize=False) or the model sees a shift.
+fixed_scale = cfg.get("fixed_scale")
+if fixed_scale:
+    _fs = float(fixed_scale)
+    logger.info("FIXED-SCALE preprocessing: images divided by %.1f, "
+                "cellpose per-image normalisation DISABLED", _fs)
+    _sc = lambda arr: [np.clip(np.asarray(im, dtype=np.float32) / _fs, 0, 1) for im in arr]
+    images = _sc(images)
+    if test_images:
+        test_images = _sc(test_images)
+    logger.info("after fixed scaling: train[0] min=%.3f max=%.3f mean=%.3f",
+                float(images[0].min()), float(images[0].max()), float(images[0].mean()))
+
 model_path, train_losses, test_losses = train.train_seg(model.net,
                             train_data=images, train_labels=labels,
                             test_data=test_images, test_labels=test_labels,
                             weight_decay=weight_decay, learning_rate=learning_rate,
                             n_epochs=n_epochs, model_name=model_name,
                             nimg_per_epoch=nimg_per_epoch,
+                            normalize=(False if fixed_scale else True),
                             batch_size=batch_size, img_transform=img_transform,
                             boundary_weight=boundary_weight)
 

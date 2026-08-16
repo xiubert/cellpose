@@ -1,0 +1,34 @@
+# FIXED-SCALE arm — removes cellpose's content-dependent normalisation.
+#
+# Cellpose scales each image to its own [p1, p99], so the input scale depends on
+# how many cells are in frame. On sparse/degeneration images p99 falls BELOW the
+# median cell pixel (notes/model_train_log.md §4d). This arm divides by a
+# constant instead and disables the per-image normalisation, so the
+# intensity->network mapping is identical for every image.
+#
+# Everything else is IDENTICAL to trainer.yaml (the clc_all_full recipe), so the
+# only variable is the input representation.
+#
+# NB inference must match: eval_seg.py --fixed_scale 255 (run_clc_cv.slurm passes
+# it automatically when EVAL_FIXED_SCALE is set). Percentile normalisation is
+# affine-invariant, so pre-scaling WITHOUT disabling it changes nothing.
+
+data:
+  source:    /ix1/pcody/cellpose/data/CLC_full3   # ignored under CV
+  model_dst: /ix1/pcody/cellpose/models
+
+train:
+  weight_decay:   0.1
+  learning_rate:  1.0e-5
+  n_epochs:       95
+  batch_size:     8
+  nimg_per_epoch: 750
+  fixed_scale:    255            # <- the only difference from trainer.yaml
+  model_name:     clc_all_fixedscale
+
+augment:
+  seed: 0
+  intensity:   {p: 0.5, scale: [0.75, 1.25], gamma: [0.8, 1.25]}
+  cutout:      {p: 0.5, n: [1, 3], size_frac: [0.05, 0.15], fill: mean}
+  gauss_noise: {p: 0.3, sigma_frac: 0.05}
+  gauss_blur:  {p: 0.2, sigma: [0.5, 1.5]}

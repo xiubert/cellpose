@@ -25,6 +25,9 @@
 #   RUN_TAG     subdir under run_logs for this CV run's per-fold CSVs
 #   INIT        (optional) warm-start model path or name (e.g. label_xfer_aug_retest)
 #   MODELS_DIR  where trained models live / are read for eval (default /ix1/.../models)
+#   EVAL_FIXED_SCALE  if set, eval with --fixed_scale <v>; MUST match the trainer
+#                     yaml's train.fixed_scale or the model is scored under a
+#                     different input distribution than it was trained on.
 
 module use ~/modulefiles
 module load cellpose_env
@@ -91,7 +94,9 @@ cp "$HOME/cellpose/models/$CELLPOSE_MODEL_NAME" "$MODELS_DIR/" \
 
 # --- eval the just-trained fold model on the held-out test set ---
 echo "=== evaluating $CELLPOSE_MODEL_NAME on held-out animal ==="
-python "$HOME/cellpose/eval_seg.py" \
+FS_ARG=""
+[ -n "${EVAL_FIXED_SCALE:-}" ] && FS_ARG="--fixed_scale $EVAL_FIXED_SCALE"
+python "$HOME/cellpose/eval_seg.py" $FS_ARG \
     --test_dir "$CELLPOSE_TEST_DIR" \
     --models "$CELLPOSE_MODEL_NAME" \
     --models_dir "$MODELS_DIR" \

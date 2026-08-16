@@ -81,6 +81,13 @@ def parse_args():
     p.add_argument("--out", default=None, help="CSV path for per-image results")
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--cpu", action="store_true", help="force CPU (default: GPU)")
+    p.add_argument("--fixed_scale", type=float, default=None,
+                   help="divide images by this constant and DISABLE cellpose's "
+                        "per-image [p1,p99] normalisation. Must match how the "
+                        "model was TRAINED (trainer yaml train.fixed_scale) — "
+                        "percentile normalisation is affine-invariant, so "
+                        "pre-scaling without disabling it is a no-op. See "
+                        "notes/model_train_log.md \u00a74d.")
     return p.parse_args()
 
 
@@ -105,6 +112,11 @@ def main():
     n_true = np.array([len(np.unique(g)) - 1 for g in gts])
 
     channel_axis = 2 if images[0].ndim == 3 else None
+    if args.fixed_scale:
+        fs = float(args.fixed_scale)
+        print(f"FIXED-SCALE eval: images / {fs:g}, per-image normalisation OFF",
+              flush=True)
+        images = [np.clip(np.asarray(im, dtype=np.float32) / fs, 0, 1) for im in images]
     rows = []          # (model, image, n_true, n_pred, ap@th...)
     summary = []       # (model, mAP@th..., mean_n_pred)
 
@@ -114,7 +126,8 @@ def main():
         print(f"=== {name} ===", flush=True)
         model = models.CellposeModel(gpu=not args.cpu, pretrained_model=path)
         masks_pred, _, _ = model.eval(images, batch_size=args.batch_size,
-                                      channel_axis=channel_axis, normalize=True)
+                                      channel_axis=channel_axis,
+                                      normalize=(not args.fixed_scale))
         ap, tp, fp, fn = average_precision(gts, masks_pred, threshold=thresholds)
         n_pred = np.array([len(np.unique(m)) - 1 for m in masks_pred])
         for i, nm in enumerate(names):

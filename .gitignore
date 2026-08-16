@@ -135,6 +135,13 @@ helpers/models
 old/
 notes/
 backup/
+# ...but helpers/notes/ is the project's experimental record, not scratch:
+# progress, runbook, per-model provenance, results. The bare `notes/` rule
+# above was catching it, leaving the whole record unversioned. Re-include the
+# directory itself first — git cannot re-include a file whose parent dir is
+# excluded — then its contents follow.
+!helpers/notes/
+!helpers/notes/**
 
 # IHC/OHC pipeline artifacts — preprocessing caches + every train/sweep/fuse
 # run is timestamped under helpers/ihc_ohc/runs/ (best.pt, geom_best.pkl,

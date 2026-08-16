@@ -840,7 +840,7 @@ size — so a real second band segment split off by an imaging gap is never
 deleted). Self-anchoring: the band defines itself as the giant component, so
 false positives can't move the reference.
 
-**Operating point, validated like row-consistency.** `clc_reject_eval.py`
+**Operating point, validated like row-consistency.** `probes/clc_reject_eval.py`
 runs the pass over the 67-image CLC set. Two reads:
 
 | | gap3 | **gap5 (default)** | gap8 |
@@ -1197,8 +1197,8 @@ upstream HCAT-data ships), use that path instead — it produces a dense
 
 ```bash
 # writes class_map into every _seg.npy in data_dir, based on max-overlap
-# with the matching <base>.xml. See helpers/label_xfer.py.
-podman exec cellpose python3 /helpers/label_xfer.py \
+# with the matching <base>.xml. See helpers/legacy/label_xfer.py.
+podman exec cellpose python3 /helpers/legacy/label_xfer.py \
     --data_dir /data/path/to/new_cochleae/
 ```
 
