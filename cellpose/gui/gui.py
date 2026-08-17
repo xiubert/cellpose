@@ -776,6 +776,21 @@ class MainW(QMainWindow):
         self.QuantFileButton.clicked.connect(self.choose_quant_file)
         self.quantBoxG.addWidget(self.QuantFileButton, 2, 6, 1, 3)
 
+        # How `show` renders the channel. The Views dropdown above applies a
+        # per-channel LUT, so without this the displayed channel would inherit
+        # whatever colour Views happened to be on — plane1/Green rendering red.
+        # `show` therefore takes over the Views selection while it is active and
+        # restores it on hide; this checkbox decides what it sets.
+        self.QuantPseudoCheck = QCheckBox("pseudocolor")
+        self.QuantPseudoCheck.setFont(self.medfont)
+        self.QuantPseudoCheck.setChecked(True)
+        self.QuantPseudoCheck.setToolTip(
+            "on: draw the shown channel in its acquisition LUT colour "
+            "(EGFP → green, ALEXA 647 → red …).\n"
+            "off: greyscale, which is the fairer way to judge intensity by eye")
+        self.QuantPseudoCheck.stateChanged.connect(self.quant_pseudocolor_changed)
+        self.quantBoxG.addWidget(self.QuantPseudoCheck, 3, 0, 1, 5)
+
         # Per-image state: discovered channels, and an explicitly-picked file
         # that overrides discovery. The source root is a session setting and
         # lives in ~/.cellpose/gui_quant.json.
@@ -787,6 +802,7 @@ class MainW(QMainWindow):
         self.quant_showing = False
         self.quant_stack_backup = None
         self.quant_saturation_backup = None
+        self.quant_color_backup = None
         self.QuantChooseC.currentIndexChanged.connect(self._update_quant_status)
 
 
@@ -2569,6 +2585,7 @@ class MainW(QMainWindow):
         self.quant_showing = False
         self.quant_stack_backup = None
         self.quant_saturation_backup = None
+        self.quant_color_backup = None
         self.QuantShowButton.setText("show")
         self.QuantShowButton.setStyleSheet(self.styleUnpressed)
         self.quant_channels = []
@@ -2652,7 +2669,8 @@ class MainW(QMainWindow):
         # If the selection changes while a channel is displayed, follow it
         # rather than leaving the viewer showing the previous channel.
         if self.quant_showing and ch is not None and \
-                ch.get("path") != getattr(self, "quant_shown_path", None):
+                (ch.get("path"), ch.get("plane_index")) != \
+                getattr(self, "quant_shown_key", None):
             self._show_quant_channel(ch)
 
     def choose_quant_source(self):
@@ -2700,12 +2718,31 @@ class MainW(QMainWindow):
         elif status == "unknown":
             print(f"WARNING: {msg}")
 
-        self.quant_override = quant.channel_from_file(path, seg_path)
-        self.quant_override["pairing_override"] = (status == "mismatch")
+        # A picked composite contributes one entry per plane, exactly as a
+        # discovered one does — so the list is populated the same way however
+        # the file was found, and the user still chooses which plane.
+        try:
+            chans = quant.channels_from_file(path, seg_path)
+        except Exception as e:  # noqa: BLE001
+            print(f"ERROR: could not read {path}: {e}")
+            return
+        if not chans:
+            print(f"ERROR: no usable image data in {path}")
+            return
+        for c in chans:
+            c["pairing_override"] = (status == "mismatch")
+
+        self.quant_channels = chans
+        self.quant_override = None
         self.QuantChooseC.blockSignals(True)
+        self.QuantChooseC.clear()
+        self.QuantChooseC.addItem("select channel to measure")
+        for c in chans:
+            self.QuantChooseC.addItem(quant.channel_label(c))
         self.QuantChooseC.setCurrentIndex(0)
         self.QuantChooseC.blockSignals(False)
-        print(f"GUI_INFO: quant channel file → {path}")
+        print(f"GUI_INFO: quant channel file → {path} "
+              f"({len(chans)} channel(s))")
         self._update_quant_status()
 
     def toggle_quant_show(self):
@@ -2732,7 +2769,7 @@ class MainW(QMainWindow):
         loaded image is applied, keeping the sliders meaningful.
         """
         try:
-            plane, plane_idx = quant.channel_plane(ch["path"])
+            plane, plane_idx = quant.channel_plane(ch)
         except Exception as e:  # noqa: BLE001
             print(f"ERROR: could not read channel image: {e}")
             return
@@ -2758,9 +2795,10 @@ class MainW(QMainWindow):
         if not self.quant_showing:
             self.quant_stack_backup = self.stack
             self.quant_saturation_backup = copy.deepcopy(self.saturation)
+            self.quant_color_backup = self.RGBDropDown.currentIndex()
         self.stack = stack
         self.quant_showing = True
-        self.quant_shown_path = ch["path"]
+        self.quant_shown_key = (ch["path"], ch.get("plane_index"))
 
         # Percentile levels for the new channel. Only when auto-adjust is on —
         # if the user set levels by hand, that is an explicit choice to respect.
@@ -2773,10 +2811,41 @@ class MainW(QMainWindow):
 
         self.QuantShowButton.setText("hide")
         self.QuantShowButton.setStyleSheet(self.stylePressed)
+        # Own the Views colour while showing, else the channel inherits
+        # whatever LUT Views was left on (a green plane drawn red).
+        self._apply_quant_view_color(ch)
         self.update_plot()
         dye = ch.get("dye") or "dye unknown"
         print(f"GUI_INFO: showing {ch['tag']} ({dye}) — plane {plane_idx} of "
               f"{os.path.basename(ch['path'])}; masks unchanged")
+
+    # Views dropdown order: RGB, red=R, green=G, blue=B, gray, spectral.
+    _LUT_VIEW_INDEX = {"red": 1, "green": 2, "blue": 3}
+
+    def _apply_quant_view_color(self, ch):
+        """Point the Views dropdown at the right rendering for `ch`.
+
+        Greyscale unless pseudocolor is on and the channel's LUT is known —
+        an unnamed plane has no honest colour to claim, so it stays grey.
+        The plane is broadcast across all three RGB planes, so every one of
+        these selections shows the same data, only the colouring differs.
+        """
+        idx = 4  # gray
+        if self.QuantPseudoCheck.isChecked():
+            idx = self._LUT_VIEW_INDEX.get((ch.get("lut") or "").lower(), 4)
+        if self.RGBDropDown.currentIndex() != idx:
+            self.RGBDropDown.setCurrentIndex(idx)   # fires color_choose → repaint
+        return idx
+
+    def quant_pseudocolor_changed(self):
+        """Re-render immediately when the pseudocolor preference changes."""
+        if not self.quant_showing:
+            return
+        ch = self._quant_channel()
+        if ch is None:
+            return
+        self._apply_quant_view_color(ch)
+        self.update_plot()
 
     def restore_quant_view(self, quiet=False):
         """Put the segmentation channel back in the viewport.
@@ -2794,7 +2863,12 @@ class MainW(QMainWindow):
             self.saturation = self.quant_saturation_backup
             self.quant_saturation_backup = None
         self.quant_showing = False
-        self.quant_shown_path = None
+        self.quant_shown_key = None
+        # Hand the Views colour back exactly as it was before `show` took it.
+        if self.quant_color_backup is not None:
+            if self.RGBDropDown.currentIndex() != self.quant_color_backup:
+                self.RGBDropDown.setCurrentIndex(self.quant_color_backup)
+            self.quant_color_backup = None
         self.QuantShowButton.setText("show")
         self.QuantShowButton.setStyleSheet(self.styleUnpressed)
         self.update_plot()

@@ -97,8 +97,19 @@ def discover(image_path, root=None):
     return _mq().discover_channels(image_path, root or source_root())
 
 
-def channel_from_file(path, seg_path=None):
-    return _mq().channel_from_file(path, seg_path)
+def channels_from_file(path, seg_path=None):
+    """Channels offered by an explicitly-picked file.
+
+    A composite (multi-plane) file contributes one entry per plane — the same
+    treatment discovery gives a composite, so picking a file by hand and having
+    one found automatically behave identically. A single-plane file is one
+    entry.
+    """
+    mq = _mq()
+    planes = mq.discover_in_file_channels(path)
+    if len(planes) > 1:
+        return planes
+    return [mq.channel_from_file(path, seg_path)]
 
 
 def channel_label(ch):
@@ -120,14 +131,14 @@ def inspect(seg_path, channels):
     masks came from is uniformly high.
     """
     rows = _mq().inspect_channels(seg_path, channels)
-    out = [f"{'ch':<6s} {'dye':<22s} {'lut':<7s} {'plane':>5s} {'in-mask':>9s} "
+    out = [f"{'channel':<9s} {'dye':<22s} {'lut':<7s} {'plane':>5s} {'in-mask':>9s} "
            f"{'bg':>8s} {'p99':>6s} {'sat':>6s} {'cell p5':>8s} {'cell p95':>9s}"]
     for r in rows:
         if "error" in r:
-            out.append(f"{r['tag']:<6s} ERROR: {r['error']}")
+            out.append(f"{r['tag']:<9s} ERROR: {r['error']}")
             continue
         star = "*" if r["is_seg_channel"] else " "
-        out.append(f"{r['tag']:<5s}{star} {(r['dye'] or '?'):<22s} "
+        out.append(f"{r['tag']:<8s}{star} {(r['dye'] or '?'):<22s} "
                    f"{(r['lut'] or '?'):<7s} {str(r['plane']):>5s} "
                    f"{r['in_mask_mean']:>9.1f} {r['bg_mean']:>8.1f} "
                    f"{r['p99']:>6.0f} {r['frac_saturated']:>6.3f} "
@@ -161,15 +172,16 @@ def summarize(rows, meta):
     return _mq().summarize(rows, meta)
 
 
-def channel_plane(path):
-    """(plane float32, plane_index) for one channel file — the raw data plane,
+def channel_plane(ch):
+    """(plane float32, plane_index) for a channel dict — the raw data plane,
     read from the file rather than from the GUI's display stack.
 
-    Used by the view toggle. Each `_chNN` TIF wraps its data in one RGB plane
-    and which plane varies with the dye order, so the plane is detected rather
-    than assumed.
+    Used by the view toggle. For a composite the plane is the caller's explicit
+    choice; for an RGB-wrapped `_chNN` file it is detected, since which plane
+    holds the data varies with the dye order.
     """
-    plane, idx, _dtype_max = _mq().load_channel_plane(path)
+    plane, idx, _dtype_max = _mq().load_channel_plane(
+        ch["path"], ch.get("plane_index"))
     return plane, idx
 
 

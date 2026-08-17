@@ -16,6 +16,22 @@ once the pipeline has been run on real data.
 Established by direct inspection on 2026-08-16, not assumed. Every number below
 came from reading the files.
 
+### 1.0 Two file layouts exist, and both are real
+
+**Split** — one RGB-wrapped file per channel, `<base>_chNN[_SV].tif` (§1.1).
+**Composite** — every channel as a plane of ONE file, no `_chNN` token at all:
+
+```
+test_data/63x 3L 16khz_Processed001 cagag.tif   (1024,1024,3) uint8, PHOTOMETRIC.RGB
+   plane 0  mean 52.2   plane 1  mean 50.1   plane 2  mean 37.1     ← all three real
+```
+
+The first build handled only the split layout, so a composite produced an empty
+dropdown (found 2026-08-17). The two are told apart by the `_chNN` token in the
+filename, which is what defines the split layout — not by a content heuristic,
+because an RGB-wrapped *single* channel is also a 3-plane file (§1.1). Composite
+planes are listed individually and never merged.
+
 ### 1.1 Channels are separate sibling files
 
 Leica LAS X exports one RGB-wrapped TIF per acquired channel:
@@ -199,7 +215,39 @@ means that addition is a new block rather than a new file plus registry plus
 menu entry. Encoding a channel convention we have not established would
 re-introduce D1's failure mode through the back door.
 
-### D10 — The viewer can show the measured channel, as a toggle
+### D10 — Composite images offer their planes as channels
+
+**Decision.** When the path carries no `_chNN` token, the image is treated as a
+composite and **every plane** is offered as a selectable channel
+(`plane0`, `plane1`, …), read straight from the file. Planes that look empty
+are flagged `(looks empty)` but still listed. Nothing is merged, and no plane is
+marked as "the segmented one" — cpsam segments on all planes at once.
+
+**Why.** Both layouts occur in real use, and the first build silently produced
+an empty dropdown on composites. Listing planes rather than picking one is the
+same rule as D1: plane order implies marker identity no more reliably than
+channel index does.
+
+Details worth keeping:
+
+- The **`_chNN` token decides the layout**, not a content heuristic — an
+  RGB-wrapped single channel is also a 3-plane file, so "how many planes have
+  data" cannot distinguish them.
+- For a composite the plane is **forced**, not auto-detected. Auto-detection
+  (max sum) is right only for an RGB-wrapped single channel, where exactly one
+  plane holds data.
+- Planes are read from the file, so this sees **past the third plane** — the
+  GUI's own `imread_2D` truncates a >3-channel image to 3.
+- `check_pairing` short-circuits to `ok` when the channel path *is* the image
+  the seg belongs to.
+- `image_for_path` resolves a seg path to its paired image, because the CLI is
+  driven by seg paths while the GUI is driven by image paths.
+- Picking a composite by hand (`file…`) populates the dropdown with its planes,
+  so found-automatically and picked-by-hand behave identically.
+
+This also closes the old §5 limitation: `_overlay.tif` is now a usable source.
+
+### D11 — The viewer can show the measured channel, as a toggle
 
 **Decision.** A `show`/`hide` button swaps the viewport to the channel being
 quantified, masks and outlines untouched. Greyed out until a channel is
@@ -223,6 +271,18 @@ Implementation points that matter:
 - On image change the backup is **dropped, not restored** (the new image is
   already in `self.stack` by the time the reset hook runs).
 
+**It owns the Views colour while active.** The Views dropdown applies a
+per-channel LUT, so a shown channel would otherwise inherit whatever colour
+Views was last left on — plane1/Green drawn red (reported 2026-08-17). `show`
+therefore backs up the Views index, sets it, and restores it exactly on hide.
+A **pseudocolor** checkbox (default on) decides what it sets: the channel's
+acquisition LUT colour, or greyscale when off. An unnamed plane has no honest
+colour to claim and stays grey even with pseudocolor on. Greyscale is the fairer
+way to judge intensity by eye; colour is the familiar one, hence the toggle
+rather than a fixed choice. Broadcasting the plane across all three RGB planes
+is what lets every Views selection show the same data with only the colouring
+changing.
+
 **The guard that makes this safe.** `compute_segmentation` takes `self.stack`
 as its input, so running cpsam while the reporter channel was displayed would
 segment the wrong channel and produce masks that look almost plausible. The
@@ -234,7 +294,7 @@ that yields a believable output.
 different job, and blending makes per-cell intensity harder to judge, which is
 the whole reason to look.
 
-### D11 — Rejected cells are flagged, not dropped
+### D12 — Rejected cells are flagged, not dropped
 
 **Decision.** Every mask gets a row, carrying `rejected` from the hair-cell
 off-band reject sidecar. The printed summary honours Option A (excludes applied
@@ -308,10 +368,6 @@ Four seams, so the follow-on work adds rather than rewrites:
   identified by eye (via `inspect`).
 - **8-bit, saturating.** No headroom at the top of the reporter's range; see
   §1.3.
-- **`_overlay.tif` is not offered as a source** in v1. It is a lossless
-  composite and could serve where individual channel files are missing, but no
-  such case exists locally (every image with an overlay also has all three
-  channel files). Worth adding if that changes.
 - **2D only**, like the rest of the hair-cell stack.
 
 ---

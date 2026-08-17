@@ -175,21 +175,104 @@ def read_channel_metadata(xml_path):
     return out
 
 
+def image_for_path(path):
+    """The image file `path` refers to, or None.
+
+    A `_seg.npy` / `_pred.npy` / `_quant.npy` sidecar resolves to its paired
+    image; an image path is returned unchanged. Needed because the CLI is
+    driven by seg paths while the GUI is driven by image paths, and composite
+    channel discovery has to read actual pixels either way.
+    """
+    if path.lower().endswith((".tif", ".tiff", ".png")):
+        return path
+    stem = path
+    for tail in ("_seg.npy", "_pred.npy", "_quant.npy"):
+        if stem.endswith(tail):
+            stem = stem[: -len(tail)]
+            break
+    else:
+        stem = os.path.splitext(stem)[0]
+    for ext in (".tif", ".tiff", ".png"):
+        if os.path.isfile(stem + ext):
+            return stem + ext
+    return None
+
+
+_RGB_NAMES = ("Red", "Green", "Blue")
+
+
+def discover_in_file_channels(image_path, max_planes=16):
+    """Planes of a multi-channel image, offered as individual channels.
+
+    For composite acquisitions exported as ONE file (an RGB stack, or an
+    `_overlay.tif`) there are no `_chNN` siblings — the channels are planes of
+    the image itself. Every plane is listed rather than guessed between: plane
+    order carries no reliable marker identity, exactly as channel index doesn't
+    (design log §D1).
+
+    Planes are read straight from the file, so this also sees planes past the
+    third — which the GUI's own `imread_2D` truncates away.
+
+    Returns [] for a single-plane image (nothing to choose between).
+    """
+    try:
+        img = np.asarray(tifffile.imread(image_path))
+    except Exception:  # noqa: BLE001
+        return []
+    if img.ndim != 3:
+        return []
+    if img.shape[0] <= 4 and img.shape[2] > 4:   # (C,H,W) → (H,W,C)
+        img = np.moveaxis(img, 0, -1)
+    n = int(img.shape[-1])
+    if n < 2:
+        return []
+
+    out = []
+    for i in range(min(n, max_planes)):
+        pl = img[..., i]
+        # A near-empty plane is padding, or the burned-in scale bar of an
+        # RGB-wrapped single channel. Flagged, never hidden — the user decides.
+        empty = float(pl.mean()) < 1.0 or float((pl > 0).mean()) < 0.01
+        out.append({
+            "tag": f"plane{i}",
+            "index": i,
+            "path": image_path,
+            "plane_index": i,        # forced — never auto-detect for these
+            "plane": i,
+            "dye": "",
+            "lut": _RGB_NAMES[i] if n == 3 and i < 3 else "",
+            "detector": "",
+            "vmax": "",
+            "metadata_source": "",
+            "is_seg_channel": False,  # cpsam segments on all planes at once
+            "in_file": True,
+            "empty": empty,
+            "exists": True,
+        })
+    return out
+
+
 def discover_channels(image_path, source_root=None, max_channels=8):
-    """Channel files that pair with `image_path`, annotated with what's known.
+    """Channels available for `image_path`, annotated with what's known.
 
-    `source_root` is where sibling channels are looked for; None means the
-    image's own directory. Half this dataset has only the segmented channel
-    staged locally, so an empty result is a normal outcome — the caller must
-    surface it rather than substituting the segmented channel.
+    Two layouts exist in this data; both are handled.
 
-    Returns [] when the path carries no '_chNN' token at all. Each entry:
-      tag, index, path, plane (None until loaded), dye, lut, detector,
-      metadata_source, is_seg_channel, exists
+    * **split** — one RGB-wrapped file per channel (`<base>_ch00_SV.tif`, …).
+      Siblings are looked for in `source_root` (None = the image's own dir).
+      Roughly a third of the dataset has only the segmented channel staged, so
+      a short result is normal — the caller must surface it rather than
+      substituting the segmented channel.
+    * **composite** — one file holding every channel as a plane. Used when the
+      path carries no `_chNN` token, which is what identifies the split layout.
+      Also covers `_overlay.tif`.
+
+    Each entry: tag, index, path, plane_index, dye, lut, detector,
+    metadata_source, is_seg_channel, exists.
     """
     parts = split_stem(image_path)
     if parts is None:
-        return []
+        img = image_for_path(image_path)
+        return discover_in_file_channels(img) if img else []
     base, seg_ch, suf = parts
     img_dir = os.path.dirname(os.path.abspath(image_path))
     root = source_root or img_dir
@@ -228,12 +311,23 @@ def discover_channels(image_path, source_root=None, max_channels=8):
 def channel_label(ch):
     """One-line human label for a channel — the dropdown's whole job is to make
     a wrong pick obvious, so say what's known and admit what isn't."""
-    bits = [ch["tag"]]
     known = [x for x in (ch.get("dye"), ch.get("lut"), ch.get("detector")) if x]
-    bits.append(" · ".join(known) if known else "dye unknown (no MetaData)")
+    if known:
+        desc = " · ".join(known)
+    elif ch.get("in_file"):
+        # A plane of a composite: no acquisition metadata to name it by, and
+        # plane order implies no marker identity.
+        desc = "unnamed channel"
+    else:
+        desc = "dye unknown (no MetaData)"
+    label = f"{ch['tag']} — {desc}"
+    if ch.get("in_file"):
+        label += " · in this file"
+    if ch.get("empty"):
+        label += "  (looks empty)"
     if ch.get("is_seg_channel"):
-        bits.append("(segmented)")
-    return " — ".join(bits[:2]) + (f"  {bits[2]}" if len(bits) > 2 else "")
+        label += "  (segmented)"
+    return label
 
 
 def channel_from_file(path, seg_path=None):
@@ -263,13 +357,19 @@ def channel_from_file(path, seg_path=None):
 
 # ── image loading ──────────────────────────────────────────────────────────────
 
-def load_channel_plane(path):
-    """(plane float32, plane_index, dtype_max) for one RGB-wrapped channel TIF.
+def load_channel_plane(path, plane=None):
+    """(plane float32, plane_index, dtype_max) for one channel image.
 
-    Each `_chNN` file carries its data in exactly one RGB plane, and which plane
-    varies with the dye order — so the data plane is found by max sum, never by
-    "which plane has nonzero pixels". The nominally-blank planes are NOT empty:
-    they carry a burned-in scale bar (312 px at 72–255 on the probe image).
+    `plane` selects a specific plane and is what composite images use — there
+    the planes ARE the channels, so the choice is the caller's and must not be
+    second-guessed.
+
+    With `plane=None` the data plane is auto-detected by max sum, which is the
+    right behaviour for an RGB-wrapped single channel (`_chNN`): the data sits
+    in exactly one plane and which one varies with the dye order. Detection is
+    by sum, never by "which plane has nonzero pixels" — the nominally-blank
+    planes are NOT empty, they carry a burned-in scale bar (312 px at 72–255 on
+    the probe image).
     """
     img = np.asarray(tifffile.imread(path))
     dtype_max = float(np.iinfo(img.dtype).max) if np.issubdtype(
@@ -280,9 +380,15 @@ def load_channel_plane(path):
         # (C,H,W) → (H,W,C) when the small axis leads.
         if img.shape[0] <= 4 and img.shape[2] > 4:
             img = np.moveaxis(img, 0, -1)
-        sums = [float(img[..., c].astype(np.float64).sum())
-                for c in range(img.shape[-1])]
-        idx = int(np.argmax(sums))
+        if plane is not None:
+            idx = int(plane)
+            if not 0 <= idx < img.shape[-1]:
+                raise ValueError(f"plane {idx} out of range for {img.shape} "
+                                 f"in {os.path.basename(path)}")
+        else:
+            sums = [float(img[..., c].astype(np.float64).sum())
+                    for c in range(img.shape[-1])]
+            idx = int(np.argmax(sums))
         return img[..., idx].astype(np.float32), idx, dtype_max
     raise ValueError(f"unexpected image shape {img.shape} in {path}")
 
@@ -357,6 +463,14 @@ def check_pairing(seg_path, channel_path):
     acquisition. 'unknown' means one side carries no _chNN token to compare —
     honest uncertainty, allowed but reported.
     """
+    # A composite measured against its own masks is trivially paired — the
+    # "channel" is a plane of the very image the seg belongs to.
+    if seg_path.endswith("_seg.npy"):
+        base_img = seg_path[: -len("_seg.npy")]
+        for ext in (".tif", ".tiff", ".png"):
+            if os.path.abspath(channel_path) == os.path.abspath(base_img + ext):
+                return "ok", ""
+
     a = split_stem(seg_path)
     b = split_stem(channel_path)
     if a is None or b is None:
@@ -396,7 +510,8 @@ def measure_seg(seg_path, channel, *, ring_px=None, min_ring_px=None, seg=None,
                          f"{masks.ndim}")
     masks = masks.astype(np.int32)
 
-    plane, plane_idx, dtype_max = load_channel_plane(channel["path"])
+    plane, plane_idx, dtype_max = load_channel_plane(
+        channel["path"], channel.get("plane_index"))
     if plane.shape != masks.shape:
         raise ValueError(
             f"channel image {plane.shape} does not match masks {masks.shape} "
@@ -566,7 +681,8 @@ def inspect_channels(seg_path, channels, seg=None):
                "lut": ch.get("lut", ""),
                "is_seg_channel": ch.get("is_seg_channel", False)}
         try:
-            plane, plane_idx, dtype_max = load_channel_plane(ch["path"])
+            plane, plane_idx, dtype_max = load_channel_plane(
+                ch["path"], ch.get("plane_index"))
             if plane.shape != masks.shape:
                 row["error"] = f"shape {plane.shape} != masks {masks.shape}"
                 out.append(row)
@@ -757,15 +873,15 @@ def cmd_inspect(args):
         print("no channel files found — this image's siblings are not staged "
               "here; pass --source_root or measure with an explicit --file")
         return 1
-    print(f"{'ch':<6s} {'dye':<22s} {'lut':<7s} {'plane':>5s} {'in-mask':>9s} "
+    print(f"{'channel':<9s} {'dye':<22s} {'lut':<7s} {'plane':>5s} {'in-mask':>9s} "
           f"{'bg':>8s} {'p99':>6s} {'sat':>6s} {'cell p5':>8s} {'cell p95':>9s}")
     print("-" * 96)
     for r in inspect_channels(args.seg, chans):
         if "error" in r:
-            print(f"{r['tag']:<6s} ERROR: {r['error']}")
+            print(f"{r['tag']:<9s} ERROR: {r['error']}")
             continue
         star = "*" if r["is_seg_channel"] else " "
-        print(f"{r['tag']:<5s}{star} {(r['dye'] or '?'):<22s} "
+        print(f"{r['tag']:<8s}{star} {(r['dye'] or '?'):<22s} "
               f"{(r['lut'] or '?'):<7s} {str(r['plane']):>5s} "
               f"{r['in_mask_mean']:>9.1f} {r['bg_mean']:>8.1f} "
               f"{r['p99']:>6.0f} {r['frac_saturated']:>6.3f} "
